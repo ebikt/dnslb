@@ -1,0 +1,12 @@
+[submodule "submodules/trio"]
+	path = submodules/trio
+	url = https://github.com/python-trio/trio
+[submodule "submodules/attrs"]
+	path = submodules/attrs
+	url = https://github.com/python-attrs/attrs
+[submodule "submodules/trio-mysql"]
+	path = submodules/trio-mysql
+	url = https://github.com/python-trio/trio-mysql
+[submodule "submodules/trio-typing"]
+	path = submodules/trio-typing
+	url = https://github.com/python-trio/trio-typing
