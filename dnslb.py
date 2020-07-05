@@ -10,84 +10,155 @@ sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 import trio
 import trio_mysql
 import trio_mysql.cursors
+import enum
 
-from typing import List, Dict, Tuple, Any, Set, Optional, TypeVar, Type, Union
+from typing import List, Dict, Tuple, Any, Set, Optional, TypeVar, Type, Union, Iterator
+
+import toml, json
 
 MYPY=False
 if MYPY:
     from typing_extensions import TypedDict
-
-
-RECORDS=[
-    {
-        "type":  "A",
-        "name": "dbrep.gm",
-        "dest": ["gmsql3.cent", "gmsql4.cent"], #these are resolved to get resulting machines
-        "interval": 5, # 15 FIXME
-        "shift": 3, #check is executed at time.time() % inteval == shift
-        "check":["/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';"],
-        "timeout": 5, #if (timeout + dns_timeout) >= interval, then rate of checks may be halved (or even slower)
-        "expect": r'(^|\n)GOOD(\n|$)',
-        "fallback": "gmsql1.cent",
-    }
-]
-
-DNS_TIMEOUT=5
-TTL=1
-
-SQL_CONFIGURATION=dict(
-    domain_name     = "dnslb",
-    delete_unknowns = True,
-    database        = 'dns',
-    unix_socket     = '/var/run/mysqld/mysqld.sock',
-    charset         = 'utf8mb4',
-    cursorclass     = trio_mysql.cursors.DictCursor,
-)
-
 T = TypeVar('T')
+
+class ConfigError(Exception):
+    pass
+
+class MissingConfigError(ConfigError):
+    pass
+
 class ConfigExtractor: # {{{
+    """ Class that ensures that configuration has proper type
+        (raises ConfigError), no key is missing (raises MissingConfigError)
+        and all keys were used by configuration consumer (i.e. they
+        are known by application).
 
-    def __init__(self, config: Dict[str, object]) -> None:
+        usage:
+
+        with ConfigExtractor(my_config_dict) as cfg:
+            bool_value = cfg.bool('bool_key')
+            str_list   = cfg.str_l('string_list_key')
+            subsection = cfg.section('subsection')
+
+        with subsection:
+            subsection_str = cfg.str('some_key')
+    """
+
+    def __init__(self, config: Dict[str, object], section: str = '', default: Union[Dict[str, object],bool] = False) -> None: # {{{
         self._config = config
+        if isinstance(default, bool):
+            self._fake_default = default
+        else:
+            self._fake_default = False
+            for key in default:
+                self._config.setdefault(key, default[key])
+        self._known: Set[str] = set()
+        self._section = section
+        self._current_key: Optional[str] = None
+    # }}}
 
+    # {{{ auxiliary functions, defining container like behaviour and context manager
     def __contains__(self, key: str) -> bool:
+        self._current_key = key
         return key in self._config
 
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._config)
+
+    def __enter__(self) -> "ConfigExtractor":
+        return self
+
+    def __exit__(self, _t: object, e: BaseException, t: object) -> None:
+        if isinstance(e, MissingConfigError):
+            # pass exception
+            return None
+        if isinstance(e, Exception):
+            # hide original exception, raise ConfigError
+            self.reraise(e)
+        if e is None:
+            # raise exception about keys that were not used by configuration consumer
+            self.raise_unknowns()
+        return None
+
+    _fakes: Dict[object, object] = {
+        List[str]: [],
+        Dict[str, object]: {},
+    }
+
     def _get(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
+        self._current_key = key
+        self._known.add(key)
         if default is None:
-            return self._config[key] # type: ignore
+            try:
+                return self._config[key] # type: ignore
+            except KeyError as e:
+                if self._fake_default:
+                    if type in self._fakes:
+                        return self._fakes[type] # type: ignore
+                    else:
+                        return type()
+                else:
+                    raise MissingConfigError("Error when parsing section [%s]: missing key %r" % (self._section, key))
         else:
             return self._config.get(key, default) # type: ignore
 
-    def _pop(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
-        if default is None:
-            return self._config.pop(key) # type: ignore
-        else:
-            return self._config.pop(key, default) # type: ignore
+    def reraise(self, e: Exception) -> None:
+        raise ConfigError("Error when parsing key %r of [%s]: %s" % (self._current_key, self._section, e))
+
+    def raise_unknowns(self) -> None:
+        u: List[str] = list(set(self._config.keys()) - self._known)
+        if len(u):
+            u.sort()
+            raise ConfigError("Error when parsing section [%s]: unknown keys: %s" % (self._section, u))
+    # }}}
 
     def get(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
+        """ getter that tries to convert value to specified type """
         return type(self._get(key, type, default)) # type: ignore
 
-    def pop(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
-        return type(self._pop(key, type, default)) # type: ignore
+    def section(self, key: str, quote_name: bool = False, default: Union["ConfigExtractor", bool] = False) -> "ConfigExtractor":
+        """ returns ConfigExtratror of subsection stored under specified key
+            arguments:
+                quote_name  should section name be quoted when printing errors?
+                default     set this to True, to provide fake defaults when parsing.
+                                This is useful when validating default section to ignore
+                                missing keys.
+                            set this to instance of default section, to provide default values
+        """
+        ret = self._get(key, Dict[str, object])
+        if not isinstance(ret, dict):
+            raise Exception("expecting section")
+        if quote_name:
+            key = json.dumps(key)
+        if self._section != '':
+            key = "%s.%s" % (self._section, key)
+        return ConfigExtractor(ret, key, default if isinstance(default, bool) else default._config)
 
     def l_str(self, key: str, default: Optional[List[str]] = None) -> List[str]:
+        """ Get list of strings. """
         v = self._get(key, List[str], default)
         return [ str(e) for e in v ]
 
     def float(self, key: str, default: Optional[float] = None) -> float:
         return self.get(key, float, default)
 
+    def int(self, key: str, default: Optional[int] = None) -> int:
+        return self.get(key, int, default)
+
+    def bool(self, key: str, default: Optional[bool] = None) -> bool:
+        return self.get(key, bool, default)
+
+    #this function must be last, otherwise mypy is confused
     def str(self, key: str, default: Optional[str] = None) -> str:
         return self.get(key, str, default)
-# }}}
 
+# }}}
 
 class Records: # {{{
     def __init__(self, rc: "RecordController", results: Dict[str, bool]) -> None:
         self.type      = rc.type
         self.name      = rc.name
-        self.ttl       = TTL
+        self.ttl       = rc.ttl
         self.timestamp = int(time.time())
         self.results   = results
 # }}}
@@ -95,45 +166,57 @@ class Records: # {{{
 DNSResult = Tuple[str, List[str]]
 
 class RecordController: # {{{
+    """ This is in fact launcher of checks for one "loadbalanced" record.
+        It periodically runs checks and submits results to trio channel
+        specified in run() method.
+
+        logger argument is in fact mandatory, if you do not want just parse configuration
+    """
+
     results: Dict[str, bool]
-    type: str
-    name: str
-    proto: int
-    family: socket.AddressFamily
+    type:    str
+    name:    str
+    proto:   int
+    family:  socket.AddressFamily
 
-    def __init__(self, config: ConfigExtractor, logger: "Logger"): # {{{
-        self.type   = config.str('type')
-        self.family = {"A":socket.AF_INET, "AAAA":socket.AF_INET6}[self.type]
-        if 'proto' in config:
-            self.proto = getattr(socket, "IPPROTO_" + config.str('proto').lower())
-            assert isinstance(self.proto, int)
-        else:
-            self.proto = socket.IPPROTO_TCP
-        if 'socktype' in config:
-            self.socktype:int = socket.SocketKind(config.str('socktype'))
-        else:
-            self.socktype = {
-                socket.IPPROTO_TCP: socket.SOCK_STREAM,
-                socket.IPPROTO_UDP: socket.SOCK_DGRAM,
-            }.get(self.proto, 0)
-        self.name        = config.str('name')
+    def __init__(self, name: str, type: str, config: ConfigExtractor, logger: Optional["Logger"]): # {{{
+        with config:
+            self.name   = name
+            self.type   = type
+            self.family = {"A":socket.AF_INET, "AAAA":socket.AF_INET6}[self.type]
 
-        self.dest        = config.l_str('dest')
-        self.interval    = config.float('interval')
-        self.shift       = config.float('shift')
-        self.check       = config.l_str('check')
-        self.timeout     = config.float('timeout')
-        self.dns_timeout = config.float('dns_timeout', DNS_TIMEOUT)
-        self.regex       = re.compile(config.str('expect'))
-        self.fallback    = config.str('fallback', '')
+            if 'proto' in config:
+                self.proto = getattr(socket, "IPPROTO_" + config.str('proto').lower())
+                assert isinstance(self.proto, int)
+            else:
+                self.proto = socket.IPPROTO_TCP
 
-        self.logger = logger
-        logprefix = self.logprefix = "%s,%s" % (self.name, self.type)
-        logger.info(logprefix, "dest: %r" % (self.dest,))
-        logger.info(logprefix, "at time %% %.2f == %.2f" % (self.interval, self.timeout))
-        logger.info(logprefix, "check command: %r" % (self.check,))
-        logger.info(logprefix, "check timeout: %.2f, dns timeout %.2f, check.regex:%s" %
-            (self.timeout, self.dns_timeout, config.str('expect')))
+            if 'socktype' in config:
+                self.socktype:int = socket.SocketKind(config.str('socktype'))
+            else:
+                self.socktype = {
+                    socket.IPPROTO_TCP: socket.SOCK_STREAM,
+                    socket.IPPROTO_UDP: socket.SOCK_DGRAM,
+                }.get(self.proto, 0)
+
+            self.ttl         = config.int('ttl')
+            self.dest        = config.l_str('dest')
+            self.interval    = config.float('interval')
+            self.shift       = config.float('shift')
+            self.check       = config.l_str('check')
+            self.timeout     = config.float('timeout')
+            self.dns_timeout = config.float('dns_timeout')
+            self.regex       = re.compile(config.str('expect'))
+            self.fallback    = config.str('fallback', '')
+
+        if logger is not None:
+            self.logger = logger
+            logprefix = self.logprefix = "%s,%s" % (self.name, self.type)
+            logger.info(logprefix, "dest: %r" % (self.dest,))
+            logger.info(logprefix, "at time %% %.2f == %.2f" % (self.interval, self.timeout))
+            logger.info(logprefix, "check command: %r" % (self.check,))
+            logger.info(logprefix, "check timeout: %.2f, dns timeout %.2f, check.regex:%s" %
+                (self.timeout, self.dns_timeout, config.str('expect')))
     # }}}
 
     async def run_check(self, address: str) -> None: # {{{
@@ -242,7 +325,9 @@ class RecordController: # {{{
     # }}}
 # }}}
 
+
 if MYPY:
+    # Some typed cursor magic
     C_id         = TypedDict('C_id',         {"id": int})
     C_id_content = TypedDict('C_id_content', {"id": int,   "content": str})
     C_name_type  = TypedDict('C_name_type',  {"name": str, "type": str})
@@ -250,14 +335,26 @@ if MYPY:
 class SqlController: # {{{
     domain_id: int
 
-    def __init__(self, config: ConfigExtractor, logger: "Logger") -> None:
-        self.delete_unknowns:bool = config.pop('delete_unknowns', bool)
-        self.domain_name:str      = config.pop('domain_name', str)
-        self.conn                 = trio_mysql.connect(**config._config)
-        self.domain_name = '.' + self.domain_name.lstrip('.')
-        self.logger               = logger
+    def __init__(self, config: ConfigExtractor, sql_cfg: ConfigExtractor, logger: "Logger") -> None: # {{{
+        self.logger = logger
 
-    async def exl(self, cursor: trio_mysql.cursors.Cursor, query: str, arg: Optional[object]=None) -> None: #{{{ log and execute query
+        with config:
+            self.delete_unknowns  = config.bool('delete_unknowns')
+            self.domain_name      = config.str('domain_name')
+            loglevel              = config.str('loglevel')
+            logger.set_loglevel(loglevel)
+        self.domain_name = '.' + self.domain_name.lstrip('.')
+
+        sqlcfg:Dict[str,object] = dict(cursorclass=trio_mysql.cursors.DictCursor)
+        sqlcfg.update(sql_cfg._config)
+        try:
+            self.conn                 = trio_mysql.connect(**sqlcfg)
+        except Exception as e:
+            raise ConfigError("Error configuring connection to mysql: %s" % (e,))
+    # }}}
+
+    async def exl(self, cursor: trio_mysql.cursors.Cursor, query: str, arg: Optional[object]=None) -> None: # {{{
+        """ Log and execute query. Internal function. """
         if arg is None:
             self.logger.debug("sql", "Executing `%s`" % (query,))
             await cursor.execute(query)
@@ -271,7 +368,8 @@ class SqlController: # {{{
                 self.logger.debug("sql", "  %r" % (row,)) # type: ignore
     # }}}
 
-    async def prepare(self) -> None: # {{{ asynchronous init
+    async def prepare(self) -> None: # {{{
+        """ Asynchronous part of init """
         await self.conn.connect()
         async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_id]
             await self.exl(cursor, "SELECT id FROM domains WHERE name = %s", (self.domain_name[1:],))
@@ -280,8 +378,10 @@ class SqlController: # {{{
     # }}}
 
     async def delete_unkown_entries(self, known_set: Set[Tuple[str, str]]) -> None: # {{{
+        """ Deletes all entries that are not in known_set. """
         assert self.domain_name.startswith('.')
         unknown_set = set()
+        self.logger.debug("sql", "Examining database for records not in %r" % (known_set,))
         async with self.conn.transaction():
             async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_name_type]
                 await self.exl(cursor, "SELECT r.name, r.type FROM records r WHERE domain_id = %s AND type in ('A', 'AAAA')", (self.domain_id,))
@@ -300,6 +400,7 @@ class SqlController: # {{{
     # }}}
 
     async def update_records(self, records: Records) -> None: # {{{
+        """ Insert results of RecordController into database. """
         assert self.domain_name.startswith('.')
         name = records.name + self.domain_name
         now = int(records.timestamp)
@@ -331,22 +432,31 @@ class SqlController: # {{{
 # }}}
 
 class Logger: # {{{
-    DEBUG=0
-    INFO=1
-    WARNING=2
-    ERROR=3
+    """ Just a simple stderr colorised logger. It may be replaced by something more
+        sofisticated in future. """
+
+    class LogLevel(enum.IntEnum):
+        DEBUG   = 0
+        INFO    = 1
+        WARNING = 2
+        ERROR   = 3
+
+    min_level: LogLevel = LogLevel.DEBUG
+
+    def set_loglevel(self, loglevel: str) -> None:
+        self.min_level = self.LogLevel[loglevel.upper()]
 
     def debug(self, module: str, msg:str) -> None:
-        self.msg(self.DEBUG, module, msg)
+        self.msg(self.LogLevel.DEBUG, module, msg)
 
     def info(self, module: str, msg:str) -> None:
-        self.msg(self.INFO, module, msg)
+        self.msg(self.LogLevel.INFO, module, msg)
 
     def warning(self, module: str, msg:str) -> None:
-        self.msg(self.WARNING, module, msg)
+        self.msg(self.LogLevel.WARNING, module, msg)
 
     def error(self, module: str, msg:str) -> None:
-        self.msg(self.ERROR, module, msg)
+        self.msg(self.LogLevel.ERROR, module, msg)
 
     NAMES=['dbg','inf','wrn','err']
     COLORS=['30;1','32;1','33;1','31;1']
@@ -360,21 +470,44 @@ class Logger: # {{{
         self.COL_R  = self.COL_B + self.COL_R + self.COL_E
         self.COL_M  = self.COL_B + self.COL_M + self.COL_E
 
-    def msg(self, level: int, module: str, msg: str) -> None:
-        sys.stderr.write('%s[%s]%s %s[%s]%s %s\n' % (
-            self.COLORS[level], self.NAMES[level], self.COL_R,
-            self.COL_M, module, self.COL_R,
-            msg) )
+    def msg(self, level: LogLevel, module: str, msg: str) -> None:
+        if self.min_level <= level:
+            sys.stderr.write('%s[%s]%s %s[%s]%s %s\n' % (
+                self.COLORS[level], self.NAMES[level], self.COL_R,
+                self.COL_M, module, self.COL_R,
+                msg) )
 # }}}
 
 class Main: # {{{
-    async def init(self) -> None: # {{{
+    """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
+
+    def __init__(self) -> None: # {{{
         self.logger = Logger()
 
-        self.rcs = []
-        for r in RECORDS:
-            self.rcs.append(RecordController(ConfigExtractor(r), self.logger))
-        self.sql = SqlController(ConfigExtractor(SQL_CONFIGURATION), self.logger)
+        #FIXME parse command line (config file, debug level)
+        try:
+            with ConfigExtractor(toml.load('configs/dnslb/dnslb.toml')) as config: # type: ignore
+                conf_global  = config.section('global')
+                conf_sql     = config.section('mysql')
+                conf_records = config.section('records')
+                conf_default = config.section('default', default=True)
+
+            try:
+                RecordController('default', 'A', conf_default, None)
+            except MissingConfigError:
+                pass
+
+            self.sql = SqlController(conf_global, conf_sql, self.logger) # sets also loglevel
+
+            self.rcs = []
+            for name in conf_records:
+                r = conf_records.section(name, quote_name = True)
+                for t in ('A', 'AAAA'):
+                    if t in r:
+                        self.rcs.append(RecordController(name, t, r.section(t, default = conf_default), self.logger))
+        except ConfigError as e:
+            sys.stderr.write(str(e) + '\n')
+            sys.exit(126)
     # }}}
 
     async def run_record_controllers(self, queue): # type: (trio.MemorySendChannel[Records]) -> None # {{{
@@ -410,7 +543,6 @@ class Main: # {{{
 
 async def main() -> None:
     m = Main()
-    await m.init()
     await m.main()
 
 trio.run(main)

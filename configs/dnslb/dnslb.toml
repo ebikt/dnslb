@@ -1,0 +1,25 @@
+#: vim: set ft=dosini :
+[global]
+domain_name     = "dnslb"
+delete_unknowns = true
+loglevel        = "debug"
+
+[mysql]
+unix_socket = "/var/run/mysqld/mysqld.sock"
+database    = "dns"
+charset     = "utf8mb4"
+
+
+[default]
+ttl          = 1
+interval     = 10
+timeout      = 5
+dns_timeout  = 3
+
+
+[records."dbrep.gm".A]
+dest     = [ "gmsql3.cent", "gmsql4.cent" ]
+shift    = 3
+check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healtcheck", "-phealtcheck", "-Bse", "select 'GOOD';" ]
+expect   = "(^|\n)GOOD(\n|$)"
+fallback = "gmsql1.cent"
