@@ -1,24 +1,26 @@
 DNSLB
 =====
 
-DNS Load balancer: DNS server, který mění odpovědi na základě výsledků healtchecků.
+DNS Load balancer: DNS server, that changes its answers based on healtcheck results.
 
-Komponenty
+This is helatcheck controller. Actual DNS service is provided by PowerDNS.
+
+Components
 ----------
 
- * PowerDNS - DNS server
- * Mysql - datový backend
- * DNSLB - controller, který spouští healtchecky (tento repozitář) a edituje databázi, kterou čte PowerDNS
+ * PowerDNS - DNS server, reads entries from database
+ * MariaDB - data backend
+ * DNSLB - controller, that is executing healtchecks (this repository) and edits entries in database
 
-Konfigurace
------------
+Configuration
+-------------
 
- * FIXME: konfigurace DNSLB je v inline v dnslb.py
- * FIXME: konfigurace a schema MYSQL je momentalne v ansible (presunout sem alespon schema)
- * FIXME: konfigurace PowerDNS je momentalne v ansible (presunout sem, mozna bez performance tuningu)
+See configs/dnslb/dnslb.toml
+
+ * FIXME: parse commandline options
 
 Performance tuning
 ------------------
- * `mysql/max_connections` >= 3 * `powerdns/receiver-threads` + 10
- * vše ostatní může být malé
- * `dnslb:` současná implementace nespustí healtchecky dokud nedoběhnou předchozí, takže se doporučuje `timeout + dns_timeout < interval`
+ * `mariadb/max_connections` >= 3 * `powerdns/receiver-threads` + 10
+ * every other mariadb setting can stay low
+ * `dnslb:` current implementation does not run next round of healtchecks (for given entry) before end of previous, thus `dns_timeout + timeout` should be lower than `interval`
