@@ -1,20 +1,23 @@
 #!/usr/bin/python3
+
+import argparse
+import enum
+import json
+import os
 import re
 import socket
+import sys
 import time
-import sys, os
+import toml
 import traceback
+
+from typing import List, Dict, Tuple, Any, Set, Optional, TypeVar, Type, Union, Iterator
 
 sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 
 import trio
 import trio_mysql
 import trio_mysql.cursors
-import enum
-
-from typing import List, Dict, Tuple, Any, Set, Optional, TypeVar, Type, Union, Iterator
-
-import toml, json
 
 MYPY=False
 if MYPY:
@@ -482,11 +485,24 @@ class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
 
     def __init__(self) -> None: # {{{
+        parser = argparse.ArgumentParser(description="DNSLB Controller")
+        parser.add_argument('-l', '--loglevel', default=None,
+            choices = [ x.name.lower() for x in Logger.LogLevel ],
+            help    = "Log level, messages with lower severity will not be printed.")
+
+        if os.environ.get('USER','') == 'dnslb':
+            default_cfg_path = '/etc/dnslb/dnslb.toml'
+        else:
+            default_cfg_path = os.path.join(os.path.dirname(__file__),'configs/dnslb/dnslb.toml')
+        parser.add_argument('-c', '--config', default=default_cfg_path, help='Configuration file')
+
+        options = parser.parse_args()
+
         self.logger = Logger()
 
         #FIXME parse command line (config file, debug level)
         try:
-            with ConfigExtractor(toml.load('configs/dnslb/dnslb.toml')) as config: # type: ignore
+            with ConfigExtractor(toml.load(options.config)) as config: # type: ignore
                 conf_global  = config.section('global')
                 conf_sql     = config.section('mysql')
                 conf_records = config.section('records')
@@ -497,7 +513,11 @@ class Main: # {{{
             except MissingConfigError:
                 pass
 
-            self.sql = SqlController(conf_global, conf_sql, self.logger) # sets also loglevel
+            # sets also loglevel, we parse conf_global in SqlController
+            self.sql = SqlController(conf_global, conf_sql, self.logger)
+
+            if options.loglevel is not None: # type: ignore
+                logger.set_loglevel(options.loglevel) # type: ignore
 
             self.rcs = []
             for name in conf_records:
