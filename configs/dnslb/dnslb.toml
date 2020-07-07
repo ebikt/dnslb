@@ -1,8 +1,22 @@
 #: vim: set ft=dosini :
 [global]
+# Operate in this domain, all records are "directly" in this zone (with no delegation)
 domain_name     = "dnslb"
+
+# delete unknown records from database
 delete_unknowns = true
+
+# minimum log level
 loglevel        = "debug"
+
+# How many records can be checked in parallel
+# note that all checks for one record are done in parallel and count as 1
+# towards this limit until last one finishes (or timeouts).
+# This should be used to prevent hitting ulimit on open files,
+# ulimit should be greater than maxrecordchecks * #max_addresses_per_record * 3
+# (not sure about the constant 3, this is mainly for filedescriptors
+#  that are opened for communicating with actual check)
+max_record_checks = 10
 
 [mysql]
 unix_socket = "/var/run/mysqld/mysqld.sock"
@@ -20,6 +34,6 @@ dns_timeout  = 3
 [records."dbrep.gm".A]
 dest     = [ "gmsql3.cent", "gmsql4.cent" ]
 shift    = 3
-check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healtcheck", "-phealtcheck", "-Bse", "select 'GOOD';" ]
+check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';" ]
 expect   = "(^|\n)GOOD(\n|$)"
 fallback = "gmsql1.cent"

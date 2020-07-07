@@ -284,11 +284,8 @@ class RecordController: # {{{
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
     # }}}
 
-    async def run(self, sqlqueue): # type: (trio.MemorySendChannel[Records]) -> None # {{{
-        while True:
-            sleep = self.interval - (time.time() - self.shift) % self.interval
-            self.logger.debug(self.logprefix, "waiting %.2f seconds" % (sleep,))
-            await trio.sleep(sleep)
+    async def run_one(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
+        async with limiter:
             try:
                 qin:  trio.MemorySendChannel[DNSResult]
                 qout: trio.MemoryReceiveChannel[DNSResult]
@@ -326,28 +323,29 @@ class RecordController: # {{{
                 self.logger.error(self.logprefix, "Error occured %s" % (traceback.format_exc(),))
                 pass
     # }}}
-# }}}
 
+    async def run_loop(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
+        while True:
+            sleep = self.interval - (time.time() - self.shift) % self.interval
+            self.logger.debug(self.logprefix, "waiting %.2f seconds" % (sleep,))
+            await trio.sleep(sleep)
+            await self.run_one(sqlqueue, limiter)
+    # }}}
+# }}}
 
 if MYPY:
     # Some typed cursor magic
     C_id         = TypedDict('C_id',         {"id": int})
-    C_id_content = TypedDict('C_id_content', {"id": int,   "content": str})
-    C_name_type  = TypedDict('C_name_type',  {"name": str, "type": str})
+    C_id_c_d     = TypedDict('C_id_c_d',     {"id": int,   "content": str,  "disabled": int})
+    C_name_type  = TypedDict('C_name_type',  {"name": str, "type":    str})
 
-class SqlController: # {{{
+class SqlController:# {{{
     domain_id: int
 
-    def __init__(self, config: ConfigExtractor, sql_cfg: ConfigExtractor, logger: "Logger") -> None: # {{{
+    def __init__(self, zone: str, delete_unknowns: bool, sql_cfg: ConfigExtractor, logger: "Logger") -> None: # {{{
         self.logger = logger
-
-        with config:
-            self.delete_unknowns  = config.bool('delete_unknowns')
-            self.domain_name      = config.str('domain_name')
-            loglevel              = config.str('loglevel')
-            logger.set_loglevel(loglevel)
-        self.domain_name = '.' + self.domain_name.lstrip('.')
-
+        self.delete_unknowns = delete_unknowns
+        self.domain_name = '.' + zone.lstrip('.')
         sqlcfg:Dict[str,object] = dict(cursorclass=trio_mysql.cursors.DictCursor)
         sqlcfg.update(sql_cfg._config)
         try:
@@ -369,6 +367,8 @@ class SqlController: # {{{
             self.logger.debug("sql", "  Returned %d rows" % (len(cursor._rows))) # type: ignore
             for row in cursor._rows: # type: ignore
                 self.logger.debug("sql", "  %r" % (row,)) # type: ignore
+        else:
+            self.logger.debug("sql", "  Returned 0 rows")
     # }}}
 
     async def prepare(self) -> None: # {{{
@@ -408,28 +408,33 @@ class SqlController: # {{{
         name = records.name + self.domain_name
         now = int(records.timestamp)
         async with self.conn.transaction():
-            async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_id_content]
-                content_ids = {}
-                delete_ids = set()
-                await self.exl(cursor, "SELECT id, content FROM records WHERE name = %s AND type = %s AND domain_id = %s",
+            async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_id_c_d]
+                content_ids:Dict[str, Tuple[int, int]] = {}
+                delete_ids:Dict[int, Tuple[str, bool]] = {}
+                await self.exl(cursor, "SELECT id, content, disabled FROM records WHERE name = %s AND type = %s AND domain_id = %s",
                     (name, records.type, self.domain_id))
                 for row in cursor:
                     content = str(row['content'])
                     id = int(row['id'])
-                    if content not in records.results or id in content_ids:
-                        delete_ids.add(id)
+                    if content not in records.results:
+                        delete_ids[id] = (content, False if int(row['disabled']) else True)
                     else:
-                        content_ids[content] = id
+                        content_ids[content] = (id, int(row['disabled']))
                 for content, enabled in records.results.items():
                     disabled = 0 if enabled else 1
                     if content in content_ids:
+                        id, last_disabled = content_ids[content]
+                        if disabled != last_disabled:
+                            self.logger.info("sql", "Record %s %s -> %s changed state to %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
                         await self.exl(cursor, "UPDATE records SET disabled = %s, last_lb_check = %s, ttl = %s WHERE id = %s",
-                                (disabled, now, records.ttl, content_ids[content]))
+                                (disabled, now, records.ttl, id))
                     else:
+                        self.logger.info("sql", "Record %s %s -> %s adding new record with state %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
                         await self.exl(cursor, "INSERT INTO records(domain_id, name, type, content, ttl, disabled, last_lb_check)" +
                             " VALUES (%s, %s, %s, %s, %s, %s, %s)",
                             (self.domain_id, name, records.type, content, records.ttl, disabled, now))
                 if len(delete_ids):
+                    self.logger.info('sql', 'Deleting old or fallback entries of %s %s: %r' % (name, records.type, delete_ids))
                     await self.exl(cursor, "DELETE FROM records WHERE id IN (" + ",".join(str(i) for i in delete_ids) + ")")
     # }}}
 # }}}
@@ -484,7 +489,8 @@ class Logger: # {{{
 class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
 
-    def __init__(self) -> None: # {{{
+    def __init__(self, immediate_checks: bool) -> None: # {{{
+        self.immediate_checks = immediate_checks
         parser = argparse.ArgumentParser(description="DNSLB Controller")
         parser.add_argument('-l', '--loglevel', default=None,
             choices = [ x.name.lower() for x in Logger.LogLevel ],
@@ -495,6 +501,7 @@ class Main: # {{{
         else:
             default_cfg_path = os.path.join(os.path.dirname(__file__),'configs/dnslb/dnslb.toml')
         parser.add_argument('-c', '--config', default=default_cfg_path, help='Configuration file')
+        parser.add_argument('-t', '--check-config', default=False, action='store_true', help='check configuration file and exit')
 
         options = parser.parse_args()
 
@@ -513,12 +520,18 @@ class Main: # {{{
             except MissingConfigError:
                 pass
 
-            # sets also loglevel, we parse conf_global in SqlController
-            self.sql = SqlController(conf_global, conf_sql, self.logger)
+            with conf_global:
+                sql_del_unk = conf_global.bool('delete_unknowns')
+                sql_zone    = conf_global.str('domain_name')
+                loglevel    = conf_global.str('loglevel')
+                self.rclim  = trio.CapacityLimiter(conf_global.int('max_record_checks'))
 
             if options.loglevel is not None: # type: ignore
-                loglevel:str = options.loglevel
-                self.logger.set_loglevel(loglevel)
+                loglevel = options.loglevel
+
+            self.logger.set_loglevel(loglevel)
+
+            self.sql = SqlController(sql_zone, sql_del_unk, conf_sql, self.logger)
 
             self.rcs = []
             for name in conf_records:
@@ -529,13 +542,23 @@ class Main: # {{{
         except ConfigError as e:
             sys.stderr.write(str(e) + '\n')
             sys.exit(126)
+
+        if options.check_config: #type: ignore
+            self.check_config = True
+        else:
+            self.check_config = False
     # }}}
 
     async def run_record_controllers(self, queue): # type: (trio.MemorySendChannel[Records]) -> None # {{{
         async with queue:
+            if self.immediate_checks:
+                async with trio.open_nursery() as nursery_first:
+                    for rc in self.rcs:
+                        nursery_first.start_soon(rc.run_one, queue, self.rclim)
+                self.logger.info('main', 'First check done for all queries, now it is safe to start dns server')
             async with trio.open_nursery() as nursery:
                 for rc in self.rcs:
-                    nursery.start_soon(rc.run, queue)
+                    nursery.start_soon(rc.run_loop, queue, self.rclim)
         self.logger.warning('main', "Something happened, controllers nursery was terminated.")
     # }}}
 
@@ -551,6 +574,8 @@ class Main: # {{{
 
     async def main(self) -> None: # {{{
         await self.sql.prepare()
+        if self.check_config:
+            return
         await self.sql.delete_unkown_entries(set([(rc.name, rc.type) for rc in self.rcs]))
         sqlin:  trio.MemorySendChannel[Records]
         sqlout: trio.MemoryReceiveChannel[Records]
@@ -563,7 +588,7 @@ class Main: # {{{
     # }}}
 
 async def main() -> None:
-    m = Main()
+    m = Main(True)
     await m.main()
 
 trio.run(main)
