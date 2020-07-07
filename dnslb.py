@@ -3,13 +3,14 @@
 import argparse
 import os
 import re
+import signal
 import socket
 import sys
 import time
 import toml
 import traceback
 
-from typing import List, Dict, Tuple, Set, Optional
+from typing import AsyncIterator, Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 
@@ -389,10 +390,29 @@ class Main: # {{{
                     raise
     # }}}
 
-    async def main(self) -> None: # {{{
+    async def handle_reload(self, sigiter: AsyncIterator[signal.Signals], canceler: trio.CancelScope) -> None:
+        async for signum in sigiter:
+            if signum == signal.SIGUSR1:
+                self.logger.info('main', 'Reloading')
+                try:
+                    new_main = Main(False)
+                    await new_main.initialize()
+                except Exception as e:
+                    self.logger.error('main', 'Error loading new configuration: %s' % (e,))
+                    continue
+                self.next_main = new_main
+                canceler.cancel()
+                return
+
+    next_main: Optional["Main"]
+
+    async def initialize(self) -> bool: # {{{
+        self.next_main = None
         await self.sql.prepare()
-        if self.check_config:
-            return
+        return not self.check_config
+    # }}}
+
+    async def main(self, usr1: AsyncIterator[signal.Signals]) -> Optional["Main"]: # {{{
         await self.sql.delete_unkown_entries(set([(rc.name, rc.type) for rc in self.rcs]))
         sqlin:  trio.MemorySendChannel[Records]
         sqlout: trio.MemoryReceiveChannel[Records]
@@ -401,11 +421,21 @@ class Main: # {{{
         async with trio.open_nursery() as nursery:
             nursery.start_soon(self.run_record_controllers, sqlin)
             nursery.start_soon(self.run_sql, sqlout)
-        self.logger.debug("main", "Finish.")
+            nursery.start_soon(self.handle_reload, usr1, nursery.cancel_scope)
+        if self.next_main:
+            self.logger.info('main', 'Reloaded.')
+        else:
+            self.logger.debug("main", "Finish.")
+        return self.next_main
     # }}}
 
 async def main() -> None:
-    m = Main(True)
-    await m.main()
+    with trio.open_signal_receiver(signal.SIGUSR1) as usr1:
+        m: Optional[Main] = Main(True)
+        if m is not None:
+            if not await m.initialize():
+                return
+        while m is not None:
+            m = await m.main(usr1)
 
 trio.run(main)
