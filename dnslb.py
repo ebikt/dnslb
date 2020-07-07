@@ -490,7 +490,7 @@ class Main: # {{{
             choices = [ x.name.lower() for x in Logger.LogLevel ],
             help    = "Log level, messages with lower severity will not be printed.")
 
-        if os.environ.get('USER','') == 'dnslb':
+        if os.environ.get('USER','') == 'dnslb' or os.getuid() == 0:
             default_cfg_path = '/etc/dnslb/dnslb.toml'
         else:
             default_cfg_path = os.path.join(os.path.dirname(__file__),'configs/dnslb/dnslb.toml')
