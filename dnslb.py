@@ -1,8 +1,6 @@
 #!/usr/bin/python3
 
 import argparse
-import enum
-import json
 import os
 import re
 import socket
@@ -11,7 +9,7 @@ import time
 import toml
 import traceback
 
-from typing import List, Dict, Tuple, Any, Set, Optional, TypeVar, Type, Union, Iterator
+from typing import List, Dict, Tuple, Set, Optional
 
 sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 
@@ -19,143 +17,12 @@ import trio
 import trio_mysql
 import trio_mysql.cursors
 
+from dnslb.config_extractor import ConfigExtractor, ConfigError
+from dnslb.simple_logger import Logger
+
 MYPY=False
 if MYPY:
     from typing_extensions import TypedDict
-T = TypeVar('T')
-
-class ConfigError(Exception):
-    pass
-
-class MissingConfigError(ConfigError):
-    pass
-
-class ConfigExtractor: # {{{
-    """ Class that ensures that configuration has proper type
-        (raises ConfigError), no key is missing (raises MissingConfigError)
-        and all keys were used by configuration consumer (i.e. they
-        are known by application).
-
-        usage:
-
-        with ConfigExtractor(my_config_dict) as cfg:
-            bool_value = cfg.bool('bool_key')
-            str_list   = cfg.str_l('string_list_key')
-            subsection = cfg.section('subsection')
-
-        with subsection:
-            subsection_str = cfg.str('some_key')
-    """
-
-    def __init__(self, config: Dict[str, object], section: str = '', default: Union[Dict[str, object],bool] = False) -> None: # {{{
-        self._config = config
-        if isinstance(default, bool):
-            self._fake_default = default
-        else:
-            self._fake_default = False
-            for key in default:
-                self._config.setdefault(key, default[key])
-        self._known: Set[str] = set()
-        self._section = section
-        self._current_key: Optional[str] = None
-    # }}}
-
-    # {{{ auxiliary functions, defining container like behaviour and context manager
-    def __contains__(self, key: str) -> bool:
-        self._current_key = key
-        return key in self._config
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._config)
-
-    def __enter__(self) -> "ConfigExtractor":
-        return self
-
-    def __exit__(self, _t: object, e: BaseException, t: object) -> None:
-        if isinstance(e, MissingConfigError):
-            # pass exception
-            return None
-        if isinstance(e, Exception):
-            # hide original exception, raise ConfigError
-            self.reraise(e)
-        if e is None:
-            # raise exception about keys that were not used by configuration consumer
-            self.raise_unknowns()
-        return None
-
-    _fakes: Dict[object, object] = {
-        List[str]: [],
-        Dict[str, object]: {},
-    }
-
-    def _get(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
-        self._current_key = key
-        self._known.add(key)
-        if default is None:
-            try:
-                return self._config[key] # type: ignore
-            except KeyError as e:
-                if self._fake_default:
-                    if type in self._fakes:
-                        return self._fakes[type] # type: ignore
-                    else:
-                        return type()
-                else:
-                    raise MissingConfigError("Error when parsing section [%s]: missing key %r" % (self._section, key))
-        else:
-            return self._config.get(key, default) # type: ignore
-
-    def reraise(self, e: Exception) -> None:
-        raise ConfigError("Error when parsing key %r of [%s]: %s" % (self._current_key, self._section, e))
-
-    def raise_unknowns(self) -> None:
-        u: List[str] = list(set(self._config.keys()) - self._known)
-        if len(u):
-            u.sort()
-            raise ConfigError("Error when parsing section [%s]: unknown keys: %s" % (self._section, u))
-    # }}}
-
-    def get(self, key: str, type: Type[T],  default: Optional[T] = None) -> T:
-        """ getter that tries to convert value to specified type """
-        return type(self._get(key, type, default)) # type: ignore
-
-    def section(self, key: str, quote_name: bool = False, default: Union["ConfigExtractor", bool] = False) -> "ConfigExtractor":
-        """ returns ConfigExtratror of subsection stored under specified key
-            arguments:
-                quote_name  should section name be quoted when printing errors?
-                default     set this to True, to provide fake defaults when parsing.
-                                This is useful when validating default section to ignore
-                                missing keys.
-                            set this to instance of default section, to provide default values
-        """
-        ret = self._get(key, Dict[str, object])
-        if not isinstance(ret, dict):
-            raise Exception("expecting section")
-        if quote_name:
-            key = json.dumps(key)
-        if self._section != '':
-            key = "%s.%s" % (self._section, key)
-        return ConfigExtractor(ret, key, default if isinstance(default, bool) else default._config)
-
-    def l_str(self, key: str, default: Optional[List[str]] = None) -> List[str]:
-        """ Get list of strings. """
-        v = self._get(key, List[str], default)
-        return [ str(e) for e in v ]
-
-    def float(self, key: str, default: Optional[float] = None) -> float:
-        return self.get(key, float, default)
-
-    def int(self, key: str, default: Optional[int] = None) -> int:
-        return self.get(key, int, default)
-
-    def bool(self, key: str, default: Optional[bool] = None) -> bool:
-        return self.get(key, bool, default)
-
-    #this function must be last, otherwise mypy is confused
-    def str(self, key: str, default: Optional[str] = None) -> str:
-        return self.get(key, str, default)
-
-# }}}
 
 class Records: # {{{
     def __init__(self, rc: "RecordController", results: Dict[str, bool]) -> None:
@@ -439,53 +306,6 @@ class SqlController:# {{{
     # }}}
 # }}}
 
-class Logger: # {{{
-    """ Just a simple stderr colorised logger. It may be replaced by something more
-        sofisticated in future. """
-
-    class LogLevel(enum.IntEnum):
-        DEBUG   = 0
-        INFO    = 1
-        WARNING = 2
-        ERROR   = 3
-
-    min_level: LogLevel = LogLevel.DEBUG
-
-    def set_loglevel(self, loglevel: str) -> None:
-        self.min_level = self.LogLevel[loglevel.upper()]
-
-    def debug(self, module: str, msg:str) -> None:
-        self.msg(self.LogLevel.DEBUG, module, msg)
-
-    def info(self, module: str, msg:str) -> None:
-        self.msg(self.LogLevel.INFO, module, msg)
-
-    def warning(self, module: str, msg:str) -> None:
-        self.msg(self.LogLevel.WARNING, module, msg)
-
-    def error(self, module: str, msg:str) -> None:
-        self.msg(self.LogLevel.ERROR, module, msg)
-
-    NAMES=['dbg','inf','wrn','err']
-    COLORS=['30;1','32;1','33;1','31;1']
-    COL_B='\x1b['
-    COL_E='m'
-    COL_R='0'
-    COL_M='36'
-
-    def __init__(self) -> None:
-        self.COLORS = [ self.COL_B + x + self.COL_E for x in self.COLORS ]
-        self.COL_R  = self.COL_B + self.COL_R + self.COL_E
-        self.COL_M  = self.COL_B + self.COL_M + self.COL_E
-
-    def msg(self, level: LogLevel, module: str, msg: str) -> None:
-        if self.min_level <= level:
-            sys.stderr.write('%s[%s]%s %s[%s]%s %s\n' % (
-                self.COLORS[level], self.NAMES[level], self.COL_R,
-                self.COL_M, module, self.COL_R,
-                msg) )
-# }}}
-
 class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
 
@@ -515,10 +335,7 @@ class Main: # {{{
                 conf_records = config.section('records')
                 conf_default = config.section('default', default=True)
 
-            try:
-                RecordController('default', 'A', conf_default, None)
-            except MissingConfigError:
-                pass
+            RecordController('default', 'A', conf_default, None)
 
             with conf_global:
                 sql_del_unk = conf_global.bool('delete_unknowns')
