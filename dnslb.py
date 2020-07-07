@@ -517,7 +517,8 @@ class Main: # {{{
             self.sql = SqlController(conf_global, conf_sql, self.logger)
 
             if options.loglevel is not None: # type: ignore
-                logger.set_loglevel(options.loglevel) # type: ignore
+                loglevel:str = options.loglevel
+                self.logger.set_loglevel(loglevel)
 
             self.rcs = []
             for name in conf_records:
