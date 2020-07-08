@@ -19,7 +19,8 @@ import trio_mysql
 import trio_mysql.cursors
 
 from dnslb.config_extractor import ConfigExtractor, ConfigError
-from dnslb.simple_logger import Logger
+from dnslb.simple_logger    import Logger
+from dnslb.systemd_notifier import SDNotifier
 
 MYPY=False
 if MYPY:
@@ -310,8 +311,10 @@ class SqlController:# {{{
 class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
 
-    def __init__(self, immediate_checks: bool) -> None: # {{{
+    def __init__(self, immediate_checks: bool, sd_notifier: SDNotifier, logger:Logger) -> None: # {{{
         self.immediate_checks = immediate_checks
+        self.sd_notifier      = sd_notifier
+        self.logger           = logger
         parser = argparse.ArgumentParser(description="DNSLB Controller")
         parser.add_argument('-l', '--loglevel', default=None,
             choices = [ x.name.lower() for x in Logger.LogLevel ],
@@ -325,8 +328,6 @@ class Main: # {{{
         parser.add_argument('-t', '--check-config', default=False, action='store_true', help='check configuration file and exit')
 
         options = parser.parse_args()
-
-        self.logger = Logger()
 
         #FIXME parse command line (config file, debug level)
         try:
@@ -374,6 +375,9 @@ class Main: # {{{
                     for rc in self.rcs:
                         nursery_first.start_soon(rc.run_one, queue, self.rclim)
                 self.logger.info('main', 'First check done for all queries, now it is safe to start dns server')
+                await self.sd_notifier.notify('Running', ready=True)
+            else:
+                await self.sd_notifier.notify('Reloaded', ready=True)
             async with trio.open_nursery() as nursery:
                 for rc in self.rcs:
                     nursery.start_soon(rc.run_loop, queue, self.rclim)
@@ -394,11 +398,13 @@ class Main: # {{{
         async for signum in sigiter:
             if signum == signal.SIGUSR1:
                 self.logger.info('main', 'Reloading')
+                await self.sd_notifier.notify("Reloading", reloading=True)
                 try:
-                    new_main = Main(False)
+                    new_main = Main(False, self.sd_notifier, self.logger)
                     await new_main.initialize()
                 except Exception as e:
                     self.logger.error('main', 'Error loading new configuration: %s' % (e,))
+                    await self.sd_notifier.notify("Reload failed!", ready=True)
                     continue
                 self.next_main = new_main
                 canceler.cancel()
@@ -409,6 +415,11 @@ class Main: # {{{
     async def initialize(self) -> bool: # {{{
         self.next_main = None
         await self.sql.prepare()
+        max_interval = 0.0
+        for rc in self.rcs:
+            max_interval = max(max_interval, rc.interval)
+        if self.immediate_checks:
+            await self.sd_notifier.notify(extend_timeout = max_interval)
         return not self.check_config
     # }}}
 
@@ -428,10 +439,14 @@ class Main: # {{{
             self.logger.debug("main", "Finish.")
         return self.next_main
     # }}}
+# }}}
 
 async def main() -> None:
+    logger = Logger()
+    sd_notifier = SDNotifier(logger = logger)
     with trio.open_signal_receiver(signal.SIGUSR1) as usr1:
-        m: Optional[Main] = Main(True)
+        m: Optional[Main] = Main(True, sd_notifier, logger)
+        await sd_notifier.notify(status="Starting.")
         if m is not None:
             if not await m.initialize():
                 return
