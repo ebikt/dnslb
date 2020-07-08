@@ -1,0 +1,23 @@
+[Unit]
+Description=DNSLB Controller for PowerDNS
+Documentation=https://git.isrv.cz/tomas.ebenlendr/dnslb
+Wants=network-online.target
+After=network-online.target mysqld.service mariadb.service
+Before=pdns.service
+RequiredBy=pdns.service
+
+[Service]
+Type=notify
+ExecStart=/centrum/dnslb/dnslb.py -c /etc/dnslb/dnslb.toml -l info
+ExecReload=/centrum/dnslb/dnslb.py -c /etc/dnslb/dnslb.toml -l info -t
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecReload=/bin/sleep 0.2
+Restart=always
+RestartSec=1
+#This interval is extended by notification from the service itself
+TimeoutStartSec=15
+User=dnslb
+Group=dnslb
+
+[Install]
+WantedBy=multi-user.target
