@@ -4,7 +4,10 @@ Documentation=https://git.isrv.cz/tomas.ebenlendr/dnslb
 Wants=network-online.target
 After=network-online.target mysqld.service mariadb.service
 Before=pdns.service
-RequiredBy=pdns.service
+# Start pdns (after) when something (*RE*)starts dnslb.service
+# Systemd can stop pdns when dnslb fails, but it cannot make pdns fail,
+# so it won't be restarted without 'Wants'
+Wants=pdns.service
 
 [Service]
 Type=notify
