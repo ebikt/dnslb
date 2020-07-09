@@ -77,7 +77,7 @@ class SDNotifier:
             else:
                 lines[b'WATCHDOG'] = b'trigger'
         if extend_timeout is not None:
-            lines[b'EXTEND_TIMEOUT_USEC='] ="{:.0f}".format( extend_timeout * 1000000 ).encode('ascii')
+            lines[b'EXTEND_TIMEOUT_USEC'] ="{:.0f}".format( extend_timeout * 1000000 ).encode('ascii')
         message = [b'%s=%s\n' % pair for pair in lines.items()]
         self.logger.debug('sdnotify', 'notify(%r)' % (message,))
         if self.ignore_exc:
