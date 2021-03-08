@@ -30,10 +30,22 @@ interval     = 10
 timeout      = 5
 dns_timeout  = 3
 
-
 [records."dbrep.gm".A]
 dest     = [ "gmsql3.cent", "gmsql4.cent" ]
 shift    = 3
 check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';" ]
 expect   = "(^|\n)GOOD(\n|$)"
 fallback = "gmsql1.cent"
+
+# If check returns priority information (integer) we can parse it
+# by following regexp (default empty):
+# prio_regex = "^OK: priority ([0-9]+)"
+
+# Minimum count of servers when disabling servers by priority
+# Example:
+#   Let prio_min_cnt == 3.
+#   Assume checks return priorities 4, 3, 2, 2, 2, 1, 1 for our seven servers.
+#   Then result will have 5 entries (priority 2 and higher) as priority
+#   3 and higher do not satisfy minimum server count (prio_min_cnt) whereas
+#   priority 2 and higehr does.
+# prio_min_cnt = 1

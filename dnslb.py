@@ -45,11 +45,13 @@ class RecordController: # {{{
         logger argument is in fact mandatory, if you do not want just parse configuration
     """
 
-    results: Dict[str, bool]
+    results: Dict[str, int]
     type:    str
     name:    str
     proto:   int
     family:  socket.AddressFamily
+    prio_regex:    Optional[re.Pattern[str]]
+    prio_min_cnt: int
 
     def __init__(self, name: str, type: str, config: ConfigExtractor, logger: Optional["Logger"]): # {{{
         with config:
@@ -79,7 +81,13 @@ class RecordController: # {{{
             self.timeout     = config.float('timeout')
             self.dns_timeout = config.float('dns_timeout')
             self.regex       = re.compile(config.str('expect'))
-            self.fallback    = config.str('fallback', '')
+            prio_regex       = re.compile(config.str('prio_regex', ''))
+            if prio_regex.groups > 0:
+                self.prio_regex = prio_regex
+            else:
+                self.prio_regex = None
+            self.prio_min_cnt = config.int('prio_min_cnt', 1)
+            self.fallback     = config.str('fallback', '')
 
         if logger is not None:
             self.logger = logger
@@ -99,9 +107,20 @@ class RecordController: # {{{
             self.logger.debug(logprefix, "launching %r" % (cmdline,))
             with trio.fail_after(self.timeout):
                 result = await trio.run_process(cmdline, capture_stdout=True)
-            if self.regex.search(result.stdout.decode('utf-8', 'ignore')):
-                self.logger.debug(logprefix, "destination OK")
-                self.results[address] = True
+            outu = result.stdout.decode('utf-8', 'ignore')
+            if self.regex.search(outu):
+                if self.prio_regex is not None:
+                    m = self.prio_regex.search(outu)
+                    if m:
+                        prio = int(m.group(1))
+                        self.logger.debug(logprefix, "destination OK with priority %d" % (prio,))
+                    else:
+                        prio = 1
+                        self.logger.debug(logprefix, "destination OK, priority not matched (using 1)")
+                    self.results[address] = prio
+                else:
+                    self.logger.debug(logprefix, "destination OK")
+                    self.results[address] = 1
             else:
                 self.logger.debug(logprefix, "destination failed")
         except Exception as e:
@@ -147,7 +166,7 @@ class RecordController: # {{{
                 for address in result:
                     if address not in self.results:
                         self.logger.debug(self.logprefix, " %s -> %s, Queueing check." % (query, address))
-                        self.results[address] = False
+                        self.results[address] = 0
                         nursery.start_soon(self.run_check, address)
                     else:
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
@@ -165,7 +184,7 @@ class RecordController: # {{{
 
                 any_ok = False
                 for rv in self.results.values():
-                    if rv: any_ok = True
+                    if rv > 0: any_ok = True
 
                 if not any_ok:
                     if self.fallback:
@@ -180,11 +199,26 @@ class RecordController: # {{{
                             self.logger.warning(self.logprefix, "Cannot resolve fallback. Deleting entry.")
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
-                            self.results[r] = True
+                            self.results[r] = 1
                     else:
                         self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
                 self.logger.debug(self.logprefix, "Sending result")
-                await sqlqueue.send(Records(self, self.results))
+                if len(self.results):
+                    histo:Dict[int, int] = {}
+                    for v in self.results.values():
+                        if v >= 0:
+                            if v not in histo:
+                                histo[v] = 0
+                            histo[v] += 1
+                    sumc = 0
+                    for v, c in sorted(histo.items(), reverse=True):
+                        sumc = sumc + c
+                        minv = v
+                        if sumc >= self.prio_min_cnt:
+                            break
+                else:
+                    minv = 1
+                await sqlqueue.send(Records(self, { k:v >= minv for k, v in self.results.items()}))
                 self.results = None # type: ignore # Disable editting of self.results after passed away
             except trio.Cancelled:
                 raise
