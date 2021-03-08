@@ -262,13 +262,13 @@ class SqlController:# {{{
                         entry = (row['name'][:-len(self.domain_name)], row['type'])
                         if entry not in known_set:
                             unknown_set.add( (row['name'], row['type'], self.domain_id) )
-            if len(unknown_set):
-                if self.delete_unkown_entries:
-                    self.logger.warning("sql", "Deleting unknown entries: %r" % (unknown_set))
-                    for unk in unknown_set:
-                        await self.exl(cursor, "DELETE FROM records WHERE name = %s, type = %s, domain_id = %s", unk)
-                else:
-                    self.logger.warning("sql", "Keeping unknown entries: %r" % (unknown_set))
+                if len(unknown_set):
+                    if self.delete_unkown_entries:
+                        self.logger.warning("sql", "Deleting unknown entries: %r" % (unknown_set))
+                        for unk in unknown_set:
+                            await self.exl(cursor, "DELETE FROM records WHERE name = %s AND type = %s AND domain_id = %s", unk)
+                    else:
+                        self.logger.warning("sql", "Keeping unknown entries: %r" % (unknown_set))
     # }}}
 
     async def update_records(self, records: Records) -> None: # {{{
