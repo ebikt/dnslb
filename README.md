@@ -4,7 +4,12 @@ DNSLB
 DNS Load balancer: DNS server, that changes its answers based on healtcheck
 results.
 
-This is helatcheck controller. Actual DNS service is provided by PowerDNS.
+This is healtcheck controller. Actual DNS service is provided by PowerDNS.
+
+NOTE: No domain transfers are supported in this version. PowerDNS is meant
+to be just an authoritative server, where caching recursors (which honor TTL)
+will take the hard work of answering many clients at once. You can run two
+instances of DNSLB to achieve redundancy.
 
 DNS Loadbalancing why and where
 -------------------------------
