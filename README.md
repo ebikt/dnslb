@@ -35,7 +35,7 @@ DNS Loadbalancing why and where
    * To prevent this, no client is allowed to be in smallest (longest) prefix
      that contains all servers. Example: servers 10.0.0.159 and 10.0.0.160
      are in prefix 10.0.0.128/26, thus no client is allowed in
-     10.0.0.0 ⋯ 10.0.0.191
+     10.0.0.128 ⋯ 10.0.0.191
    * This can be turned in advantage if your goal is not loadsharing, but
      just fallback to other location.
    * Some services use `gethostbyname` which probably does not use RFC3484
