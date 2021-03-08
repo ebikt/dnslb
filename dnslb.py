@@ -25,6 +25,14 @@ from dnslb.systemd_notifier import SDNotifier
 MYPY=False
 if MYPY:
     from typing_extensions import TypedDict
+    ReStr = re.Pattern[str]
+else:
+    try:
+        # Python 3.9+
+        ReStr = re.Pattern[str]
+    except TypeError:
+        ReStr = re.Pattern
+        # Python 3.7-
 
 class Records: # {{{
     def __init__(self, rc: "RecordController", results: Dict[str, bool]) -> None:
@@ -50,7 +58,7 @@ class RecordController: # {{{
     name:    str
     proto:   int
     family:  socket.AddressFamily
-    prio_regex:    Optional[re.Pattern[str]]
+    prio_regex:    Optional[ReStr]
     prio_min_cnt: int
 
     def __init__(self, name: str, type: str, config: ConfigExtractor, logger: Optional["Logger"]): # {{{
