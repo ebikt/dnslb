@@ -41,6 +41,8 @@ DNS Loadbalancing why and where
    * Some services use `gethostbyname` which probably does not use RFC3484
      Rule 9, it is better to test your service in laboratory environment
      and/or study source code of your service.
+   * Note that implementation of Rule 9 in `getaddrinfo` differs for IPv4
+     and IPv6, and also for differrent versions of glibc.
 
 Note: mysql/mariadb uses `getaddrinfo`.
 
