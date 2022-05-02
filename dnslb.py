@@ -10,7 +10,7 @@ import time
 import toml
 import traceback
 
-from typing import AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Set, Tuple, cast
 
 sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 
@@ -120,7 +120,7 @@ class RecordController: # {{{
                 if self.prio_regex is not None:
                     m = self.prio_regex.search(outu)
                     if m:
-                        prio = int(m.group(1))
+                        prio = int(cast(str, m.group(1)))
                         self.logger.debug(logprefix, "destination OK with priority %d" % (prio,))
                     else:
                         prio = 1
