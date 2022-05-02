@@ -10,7 +10,7 @@ import time
 import toml
 import traceback
 
-from typing import AsyncIterator, Dict, List, Optional, Set, Tuple, cast
+from typing import AsyncIterator, Dict, List, Optional, Set, Tuple, cast, Union
 
 sys.path.insert(0, os.path.dirname(__file__) + '/lib')
 
@@ -250,6 +250,15 @@ if MYPY:
     C_id_c_d     = TypedDict('C_id_c_d',     {"id": int,   "content": str,  "disabled": int})
     C_name_type  = TypedDict('C_name_type',  {"name": str, "type":    str})
 
+def nameFromAscii(s: Union[str, bytes, int]) -> str: # {{{
+    if isinstance(s, str):
+        return s
+    elif isinstance(s, bytes):
+        return s.decode('ascii')
+    else:
+        raise AssertionError("Invalid type of name: %s (%r) " % (type(s), s))
+# }}}
+
 class SqlController:# {{{
     domain_id: int
 
@@ -300,8 +309,8 @@ class SqlController:# {{{
             async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_name_type]
                 await self.exl(cursor, "SELECT r.name, r.type FROM records r WHERE domain_id = %s AND type in ('A', 'AAAA')", (self.domain_id,))
                 async for row in cursor: #this cursor is prefetched (buffered), no need to async
-                    name, type_ = row['name'], row['type']
-                    assert isinstance(name, str) and isinstance(type_, str)
+                    name  = nameFromAscii(row['name'])
+                    type_ = nameFromAscii(row['type'])
                     if name.endswith(self.domain_name):
                         entry = (name[:-len(self.domain_name)], type_)
                         if entry not in known_set:
