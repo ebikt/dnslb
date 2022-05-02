@@ -299,11 +299,13 @@ class SqlController:# {{{
         async with self.conn.transaction():
             async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_name_type]
                 await self.exl(cursor, "SELECT r.name, r.type FROM records r WHERE domain_id = %s AND type in ('A', 'AAAA')", (self.domain_id,))
-                for row in cursor: #this cursor is prefetched (buffered), no need to async
-                    if row['name'].endswith(self.domain_name):
-                        entry = (row['name'][:-len(self.domain_name)], row['type'])
+                async for row in cursor: #this cursor is prefetched (buffered), no need to async
+                    name, type_ = row['name'], row['type']
+                    assert isinstance(name, str) and isinstance(type_, str)
+                    if name.endswith(self.domain_name):
+                        entry = (name[:-len(self.domain_name)], type_)
                         if entry not in known_set:
-                            unknown_set.add( (row['name'], row['type'], self.domain_id) )
+                            unknown_set.add( (name, type_, self.domain_id) )
                 if len(unknown_set):
                     if self.delete_unkown_entries:
                         self.logger.warning("sql", "Deleting unknown entries: %r" % (unknown_set))
@@ -324,7 +326,7 @@ class SqlController:# {{{
                 delete_ids:Dict[int, Tuple[str, bool]] = {}
                 await self.exl(cursor, "SELECT id, content, disabled FROM records WHERE name = %s AND type = %s AND domain_id = %s",
                     (name, records.type, self.domain_id))
-                for row in cursor:
+                async for row in cursor:
                     content = str(row['content'])
                     id = int(row['id'])
                     if content not in records.results:
