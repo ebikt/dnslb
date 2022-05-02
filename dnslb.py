@@ -74,7 +74,7 @@ class RecordController: # {{{
                 self.proto = socket.IPPROTO_TCP
 
             if 'socktype' in config:
-                self.socktype:int = socket.SocketKind(config.str('socktype'))
+                self.socktype:int = getattr(socket.SocketKind, config.str('socktype'))
             else:
                 self.socktype = {
                     socket.IPPROTO_TCP: socket.SOCK_STREAM,
