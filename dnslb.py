@@ -250,13 +250,14 @@ if MYPY:
     C_id_c_d     = TypedDict('C_id_c_d',     {"id": int,   "content": str,  "disabled": int})
     C_name_type  = TypedDict('C_name_type',  {"name": str, "type":    str})
 
-def nameFromAscii(s: Union[str, bytes, int]) -> str: # {{{
+def nameFromAscii(s: Union[str, bytes, int], strict:bool = True) -> str: # {{{
     if isinstance(s, str):
         return s
     elif isinstance(s, bytes):
         return s.decode('ascii')
-    else:
+    elif strict:
         raise AssertionError("Invalid type of name: %s (%r) " % (type(s), s))
+    return str(s)
 # }}}
 
 class SqlController:# {{{
@@ -336,7 +337,8 @@ class SqlController:# {{{
                 await self.exl(cursor, "SELECT id, content, disabled FROM records WHERE name = %s AND type = %s AND domain_id = %s",
                     (name, records.type, self.domain_id))
                 async for row in cursor:
-                    content = str(row['content'])
+                    content = nameFromAscii(row['content'], False)
+                    #self.logger.debug("TRACE", "%r (==str(%r)) in %r" % (content, row['content'], records.results))
                     id = int(row['id'])
                     if content not in records.results:
                         delete_ids[id] = (content, False if int(row['disabled']) else True)
