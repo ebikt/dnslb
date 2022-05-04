@@ -35,7 +35,7 @@ else:
         # Python 3.7-
 
 class Records: # {{{
-    def __init__(self, rc: "RecordController", results: Dict[str, bool]) -> None:
+    def __init__(self, rc: "RecordController", results: Dict[str, Tuple[bool, Optional[int]]]) -> None:
         self.type      = rc.type
         self.name      = rc.name
         self.ttl       = rc.ttl
@@ -194,7 +194,9 @@ class RecordController: # {{{
                 for rv in self.results.values():
                     if rv > 0: any_ok = True
 
+                records:Dict[str,Tuple[bool, Optional[int]]]
                 if not any_ok:
+                    records = { k:(False, v) for k, v in self.results.items() }
                     if self.fallback:
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
                         try:
@@ -207,11 +209,10 @@ class RecordController: # {{{
                             self.logger.warning(self.logprefix, "Cannot resolve fallback. Deleting entry.")
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
-                            self.results[r] = 1
+                            records[r] = (True, records.get(r, (True, None))[1])
                     else:
                         self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
-                self.logger.debug(self.logprefix, "Sending result")
-                if len(self.results):
+                else:
                     histo:Dict[int, int] = {}
                     for v in self.results.values():
                         if v >= 0:
@@ -224,9 +225,10 @@ class RecordController: # {{{
                         minv = v
                         if sumc >= self.prio_min_cnt:
                             break
-                else:
-                    minv = 1
-                await sqlqueue.send(Records(self, { k:v >= minv for k, v in self.results.items()}))
+                    records = { k:(v >= minv, v)  for k, v in self.results.items() }
+
+                self.logger.debug(self.logprefix, "Sending result")
+                await sqlqueue.send(Records(self, records))
                 self.results = None # type: ignore # Disable editting of self.results after passed away
             except trio.Cancelled:
                 raise
@@ -332,9 +334,9 @@ class SqlController:# {{{
         now = int(records.timestamp)
         async with self.conn.transaction():
             async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_id_c_d]
-                content_ids:Dict[str, Tuple[int, int]] = {}
-                delete_ids:Dict[int, Tuple[str, bool]] = {}
-                await self.exl(cursor, "SELECT id, content, disabled FROM records WHERE name = %s AND type = %s AND domain_id = %s",
+                content_ids:Dict[str, Tuple[int, int]] = {} # ip -> id, last_disabled
+                delete_ids:Dict[int, Tuple[str, bool]] = {} # id -> ip, disabled
+                await self.exl(cursor, "SELECT id, content, disabled, last_lb_check_result FROM records WHERE name = %s AND type = %s AND domain_id = %s",
                     (name, records.type, self.domain_id))
                 async for row in cursor:
                     content = nameFromAscii(row['content'], False)
@@ -344,19 +346,20 @@ class SqlController:# {{{
                         delete_ids[id] = (content, False if int(row['disabled']) else True)
                     else:
                         content_ids[content] = (id, int(row['disabled']))
-                for content, enabled in records.results.items():
-                    disabled = 0 if enabled else 1
+                for content, en_res in records.results.items():
+                    disabled = 0 if en_res[0] else 1
+                    hc_result = en_res[1]
                     if content in content_ids:
                         id, last_disabled = content_ids[content]
                         if disabled != last_disabled:
                             self.logger.info("sql", "Record %s %s -> %s changed state to %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
-                        await self.exl(cursor, "UPDATE records SET disabled = %s, last_lb_check = %s, ttl = %s WHERE id = %s",
-                                (disabled, now, records.ttl, id))
+                        await self.exl(cursor, "UPDATE records SET disabled = %s, last_lb_check = %s, ttl = %s, last_lb_check_result = %s WHERE id = %s",
+                                (disabled, now, records.ttl, hc_result, id))
                     else:
                         self.logger.info("sql", "Record %s %s -> %s adding new record with state %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
-                        await self.exl(cursor, "INSERT INTO records(domain_id, name, type, content, ttl, disabled, last_lb_check)" +
-                            " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                            (self.domain_id, name, records.type, content, records.ttl, disabled, now))
+                        await self.exl(cursor, "INSERT INTO records(domain_id, name, type, content, ttl, disabled, last_lb_check, last_lb_check_result)" +
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            (self.domain_id, name, records.type, content, records.ttl, disabled, now, hc_result))
                 if len(delete_ids):
                     self.logger.info('sql', 'Deleting old or fallback entries of %s %s: %r' % (name, records.type, delete_ids))
                     await self.exl(cursor, "DELETE FROM records WHERE id IN (" + ",".join(str(i) for i in delete_ids) + ")")
