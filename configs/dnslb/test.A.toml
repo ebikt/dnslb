@@ -1,0 +1,7 @@
+#: vim: set ft=dosini :
+["test".A]
+dest     = [ "test1.cent", "test2.cent" ]
+shift    = 3
+check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';" ]
+expect   = "(^|\n)GOOD(\n|$)"
+fallback = "test3.cent"

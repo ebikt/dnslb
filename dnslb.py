@@ -9,6 +9,7 @@ import sys
 import time
 import toml
 import traceback
+import glob
 
 from typing import AsyncIterator, Dict, List, Optional, Set, Tuple, cast, Union
 
@@ -18,7 +19,7 @@ import trio
 import trio_mysql
 import trio_mysql.cursors
 
-from dnslb.config_extractor import ConfigExtractor, ConfigError
+from dnslb.config_extractor import ConfigExtractor, ConfigError, MissingConfigError
 from dnslb.simple_logger    import Logger
 from dnslb.systemd_notifier import SDNotifier
 
@@ -45,6 +46,7 @@ class Records: # {{{
 
 DNSResult = Tuple[str, List[str]]
 
+
 class RecordController: # {{{
     """ This is in fact launcher of checks for one "loadbalanced" record.
         It periodically runs checks and submits results to trio channel
@@ -52,6 +54,8 @@ class RecordController: # {{{
 
         logger argument is in fact mandatory, if you do not want just parse configuration
     """
+
+    Id = Tuple[str, int]
 
     results: Dict[str, int]
     type:    str
@@ -103,9 +107,12 @@ class RecordController: # {{{
             logger.info(logprefix, "dest: %r" % (self.dest,))
             logger.info(logprefix, "at time %% %.2f == %.2f" % (self.interval, self.timeout))
             logger.info(logprefix, "check command: %r" % (self.check,))
-            logger.info(logprefix, "check timeout: %.2f, dns timeout %.2f, check.regex:%s" %
+            logger.info(logprefix, "check timeout: %.2f, dns timeout %.2f, check.regex:%r" %
                 (self.timeout, self.dns_timeout, config.str('expect')))
     # }}}
+
+    def id(self) -> "RecordController.Id":
+        return (self.name, self.proto)
 
     async def run_check(self, address: str) -> None: # {{{
         fmt = { "address": address}
@@ -366,6 +373,17 @@ class SqlController:# {{{
     # }}}
 # }}}
 
+def expand_glob(prefix: str, pattern: str, empty_error: Optional[str] = None) ->List[str]:
+    if pattern.startswith('/'):
+        ret = glob.glob(pattern)
+        err = f"{empty_error}: {pattern} not found."
+    else:
+        ret = glob.glob(os.path.join(glob.escape(prefix), pattern))
+        err = f"{empty_error}: {pattern} not found in {prefix}."
+    if len(ret) == 0 and empty_error:
+        raise ConfigError(err)
+    return [ os.path.realpath(x) for x in ret]
+
 class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
 
@@ -382,14 +400,30 @@ class Main: # {{{
             default_cfg_path = '/etc/dnslb/dnslb.toml'
         else:
             default_cfg_path = os.path.join(os.path.dirname(__file__),'configs/dnslb/dnslb.toml')
+
         parser.add_argument('-c', '--config', default=default_cfg_path, help='Configuration file')
-        parser.add_argument('-t', '--check-config', default=False, action='store_true', help='check configuration file and exit')
+        parser.add_argument('-t', '--check-config', default=False, action='store_true',
+                            help='check configuration file and exit')
+        parser.add_argument('-r', '--record-file',  default=[], action='append', metavar='FILE',
+                            help='Additional record configuration glob pattern (relative to working directory).')
+        parser.add_argument('-m', '--mask-record-file', default=[], action='append', metavar='FILE',
+                            help='Mask recocrd file that will be loaded by global.load_records configuration (relative to config directory).')
 
         options = parser.parse_args()
+        curdir = os.getcwd()
+        cfgdir = os.path.dirname(cast(str, options.config))
+        record_files = []
+        for pat in cast(List[str], options.record_file):
+            record_files.extend(expand_glob(curdir, glob.escape(pat), "--record-file error"))
+        mask_files_a = []
+        for pat in cast(List[str], options.mask_record_file):
+            mask_files_a.extend(expand_glob(cfgdir, glob.escape(pat), "--mask-record-file error"))
+        mask_files = set(mask_files_a)
 
         #FIXME parse command line (config file, debug level)
         try:
-            with ConfigExtractor(toml.load(options.config)) as config: # type: ignore
+            with ConfigExtractor(cast(Dict[str, object],
+                                      toml.load(cast(str, options.config)))) as config:
                 conf_global  = config.section('global')
                 conf_sql     = config.section('mysql')
                 conf_records = config.section('records')
@@ -397,11 +431,22 @@ class Main: # {{{
 
             RecordController('default', 'A', conf_default, None)
 
+            load_paths = None
             with conf_global:
                 sql_del_unk = conf_global.bool('delete_unknowns')
                 sql_zone    = conf_global.str('domain_name')
                 loglevel    = conf_global.str('loglevel')
                 self.rclim  = trio.CapacityLimiter(conf_global.int('max_record_checks'))
+                try:
+                    load_paths  = conf_global.l_str('load_records')
+                except MissingConfigError:
+                    load_paths = []
+                except Exception:
+                    load_paths  = [conf_global.str('load_records')]
+                for pat in load_paths:
+                    record_files.extend([ f for f in
+                        expand_glob(cfgdir, pat, None)
+                        if f not in mask_files])
 
             if options.loglevel is not None: # type: ignore
                 loglevel = options.loglevel
@@ -410,12 +455,21 @@ class Main: # {{{
 
             self.sql = SqlController(sql_zone, sql_del_unk, conf_sql, self.logger)
 
-            self.rcs = []
-            for name in conf_records:
-                r = conf_records.section(name, quote_name = True)
-                for t in ('A', 'AAAA'):
-                    if t in r:
-                        self.rcs.append(RecordController(name, t, r.section(t, default = conf_default), self.logger))
+            rcs:Dict[RecordController.Id, RecordController] = {}
+            def add_rcs(rcl: List[RecordController]) -> None:
+                for rc in rcl:
+                    if rc.id() in rcs:
+                        raise ConfigError(f"Duplicate entry {rc.name}.{rc.type}")
+                    rcs[rc.id()] = rc
+
+            add_rcs(self.parse_records(conf_records, conf_default))
+
+            for rcf in record_files:
+                with ConfigExtractor(cast(Dict[str, object], toml.load(rcf)),
+                                     section = repr(rcf)) as rconfig:
+                    add_rcs(self.parse_records(rconfig, conf_default))
+
+            self.rcs = list(rcs.values())
         except ConfigError as e:
             sys.stderr.write(str(e) + '\n')
             sys.exit(126)
@@ -424,6 +478,18 @@ class Main: # {{{
             self.check_config = True
         else:
             self.check_config = False
+    # }}}
+
+    def parse_records(self, conf_records: ConfigExtractor, conf_default: ConfigExtractor) -> List[RecordController]: # {{{
+        rcs = []
+        for name in conf_records:
+            r = conf_records.section(name, quote_name = True)
+            for t in r:
+                if t in ('A', 'AAAA'):
+                    rcs.append(RecordController(name, t, r.section(t, default = conf_default), self.logger))
+                else:
+                    raise Exception(f"Unsupported record type {t} of {name}")
+        return rcs
     # }}}
 
     async def run_record_controllers(self, queue): # type: (trio.MemorySendChannel[Records]) -> None # {{{

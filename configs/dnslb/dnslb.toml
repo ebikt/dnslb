@@ -18,6 +18,8 @@ loglevel        = "debug"
 #  that are opened for communicating with actual check)
 max_record_checks = 10
 
+load_records = [ '*.A.toml' ]
+
 [mysql]
 unix_socket = "/var/run/mysqld/mysqld.sock"
 database    = "dns"

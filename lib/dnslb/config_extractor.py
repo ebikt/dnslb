@@ -2,7 +2,7 @@
 
 from typing import Dict, Iterator, List, Optional, Set, Type, TypeVar, Union
 
-import json
+import json, traceback
 
 T = TypeVar('T')
 
@@ -88,7 +88,11 @@ class ConfigExtractor: # {{{
             return self._config.get(key, default) # type: ignore
 
     def reraise(self, e: Exception) -> None:
-        raise ConfigError("Error when parsing key %r of [%s]: %s" % (self._current_key, self._section, e))
+        if isinstance(e, AssertionError):
+            txt = traceback.format_exc()
+        else:
+            txt = str(e)
+        raise ConfigError("Error when parsing key %r of [%s]: <%s> %s" % (self._current_key, self._section, type(e).__name__, txt))
 
     def raise_unknowns(self) -> None:
         u: List[str] = list(set(self._config.keys()) - self._known)
