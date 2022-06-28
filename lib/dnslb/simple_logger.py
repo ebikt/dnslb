@@ -48,4 +48,5 @@ class Logger: # {{{
                 self.COLORS[level], self.NAMES[level], self.COL_R,
                 self.COL_M, module, self.COL_R,
                 msg) )
+            sys.stderr.flush()
 # }}}
