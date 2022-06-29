@@ -401,7 +401,8 @@ class Main: # {{{
         else:
             default_cfg_path = os.path.join(os.path.dirname(__file__),'configs/dnslb/dnslb.toml')
 
-        parser.add_argument('-c', '--config', default=default_cfg_path, help='Configuration file')
+        parser.add_argument('-c', '--config',  default=default_cfg_path, help='Configuration file')
+        parser.add_argument('-C', '--confdir', default="", help='Included configuration files base path (default: directory of configuration file)')
         parser.add_argument('-t', '--check-config', default=False, action='store_true',
                             help='check configuration file and exit')
         parser.add_argument('-r', '--record-file',  default=[], action='append', metavar='FILE',
@@ -411,7 +412,9 @@ class Main: # {{{
 
         options = parser.parse_args()
         curdir = os.getcwd()
-        cfgdir = os.path.dirname(cast(str, options.config))
+        cfgdir = cast(str, options.confdir)
+        if cfgdir == "":
+            cfgdir = os.path.dirname(cast(str, options.config))
         record_files = []
         for pat in cast(List[str], options.record_file):
             record_files.extend(expand_glob(curdir, glob.escape(pat), "--record-file error"))
