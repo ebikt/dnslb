@@ -405,9 +405,9 @@ class Main: # {{{
         parser.add_argument('-C', '--confdir', default="", help='Included configuration files base path (default: directory of configuration file)')
         parser.add_argument('-t', '--check-config', default=False, action='store_true',
                             help='check configuration file and exit')
-        parser.add_argument('-r', '--record-file',  default=[], action='append', metavar='FILE',
+        parser.add_argument('-r', '--record-file',  default=cast(List[str],[]), action='append', metavar='FILE',
                             help='Additional record configuration glob pattern (relative to working directory).')
-        parser.add_argument('-m', '--mask-record-file', default=[], action='append', metavar='FILE',
+        parser.add_argument('-m', '--mask-record-file', default=cast(List[str],[]), action='append', metavar='FILE',
                             help='Mask recocrd file that will be loaded by global.load_records configuration (relative to config directory).')
 
         options = parser.parse_args()
