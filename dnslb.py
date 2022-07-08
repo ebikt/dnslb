@@ -35,8 +35,26 @@ else:
         ReStr = re.Pattern
         # Python 3.7-
 
+class HealthCheckResult:
+    enabled:  bool
+    retcode:  int
+    priority: Optional[int]
+
+    NOT_MATCHED = -1
+    TIMED_OUT   = -2
+
+    def __init__(self, retcode: Union["HealthCheckResult", int], priority: Optional[int] = None):
+        if isinstance(retcode, HealthCheckResult):
+            self.retcode  = retcode.retcode
+            self.priority = retcode.priority
+            self.enabled  = priority is not None and priority > 0
+        else:
+            self.retcode  = retcode
+            self.priority = priority
+
 class Records: # {{{
-    def __init__(self, rc: "RecordController", results: Dict[str, Tuple[bool, Optional[int]]]) -> None:
+
+    def __init__(self, rc: "RecordController", results: Dict[str, HealthCheckResult]) -> None:
         self.type      = rc.type
         self.name      = rc.name
         self.ttl       = rc.ttl
@@ -57,7 +75,7 @@ class RecordController: # {{{
 
     Id = Tuple[str, int]
 
-    results: Dict[str, int]
+    results: Dict[str, HealthCheckResult]
     type:    str
     name:    str
     proto:   int
@@ -123,21 +141,29 @@ class RecordController: # {{{
             with trio.fail_after(self.timeout):
                 result = await trio.run_process(cmdline, capture_stdout=True)
             outu = result.stdout.decode('utf-8', 'ignore')
-            if self.regex.search(outu):
+            #FIXME: propagate some (sort of) error string? E.g. to prometheus/victoriadb?
+            if result.returncode != 0:
+                self.logger.debug(logprefix, "destination failed rc:%d" % (result.returncode,));
+                self.results[address] = HealthCheckResult( result.returncode )
+            elif self.regex.search(outu):
                 if self.prio_regex is not None:
                     m = self.prio_regex.search(outu)
                     if m:
-                        prio = int(cast(str, m.group(1)))
+                        try:
+                            prio = int(cast(str, m.group(1)))
+                        except ValueError:
+                            prio = len(cast(str,m.group(1)))+1
                         self.logger.debug(logprefix, "destination OK with priority %d" % (prio,))
                     else:
-                        prio = 1
-                        self.logger.debug(logprefix, "destination OK, priority not matched (using 1)")
-                    self.results[address] = prio
+                        prio = -1
+                        self.logger.debug(logprefix, "destination OK, priority not matched (disabling by prio: -1)")
+                    self.results[address] = HealthCheckResult( result.returncode, prio)
                 else:
                     self.logger.debug(logprefix, "destination OK")
-                    self.results[address] = 1
+                    self.results[address] = HealthCheckResult( result.returncode, 1)
             else:
-                self.logger.debug(logprefix, "destination failed")
+                self.logger.debug(logprefix, "destination failed: regex not matched")
+                self.results[address] = HealthCheckResult( HealthCheckResult.NOT_MATCHED )
         except Exception as e:
             self.logger.warning(logprefix, "check error: %s" % (e,))
             pass
@@ -181,7 +207,7 @@ class RecordController: # {{{
                 for address in result:
                     if address not in self.results:
                         self.logger.debug(self.logprefix, " %s -> %s, Queueing check." % (query, address))
-                        self.results[address] = 0
+                        self.results[address] = HealthCheckResult(HealthCheckResult.TIMED_OUT)
                         nursery.start_soon(self.run_check, address)
                     else:
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
@@ -199,11 +225,11 @@ class RecordController: # {{{
 
                 any_ok = False
                 for rv in self.results.values():
-                    if rv > 0: any_ok = True
+                    if rv.priority and rv.priority > 0: any_ok = True
 
-                records:Dict[str,Tuple[bool, Optional[int]]]
+                records:Dict[str,HealthCheckResult]
                 if not any_ok:
-                    records = { k:(False, v) for k, v in self.results.items() }
+                    records = { k:HealthCheckResult(v) for k, v in self.results.items() }
                     if self.fallback:
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
                         try:
@@ -216,23 +242,26 @@ class RecordController: # {{{
                             self.logger.warning(self.logprefix, "Cannot resolve fallback. Deleting entry.")
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
-                            records[r] = (True, records.get(r, (True, None))[1])
+                            records[r] = HealthCheckResult(records.get(r, HealthCheckResult(0, None)), 1)
                     else:
                         self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
                 else:
                     histo:Dict[int, int] = {}
                     for v in self.results.values():
-                        if v >= 0:
-                            if v not in histo:
-                                histo[v] = 0
-                            histo[v] += 1
+                        if v.priority and v.priority > 0:
+                            if v.priority not in histo:
+                                histo[v.priority] = 0
+                            histo[v.priority] += 1
                     sumc = 0
-                    for v, c in sorted(histo.items(), reverse=True):
+                    for vi, c in sorted(histo.items(), reverse=True):
                         sumc = sumc + c
-                        minv = v
+                        minv = vi
                         if sumc >= self.prio_min_cnt:
                             break
-                    records = { k:(v >= minv, v)  for k, v in self.results.items() }
+                    if minv > 1: minv -= 1
+                    else: minv = 0
+                    records = { k:HealthCheckResult(v, None if v.priority is None else v.priority - minv)
+                                for k, v in self.results.items() }
 
                 self.logger.debug(self.logprefix, "Sending result")
                 await sqlqueue.send(Records(self, records))
@@ -354,19 +383,18 @@ class SqlController:# {{{
                     else:
                         content_ids[content] = (id, int(row['disabled']))
                 for content, en_res in records.results.items():
-                    disabled = 0 if en_res[0] else 1
-                    hc_result = en_res[1]
+                    disabled = 0 if en_res.enabled else 1
                     if content in content_ids:
                         id, last_disabled = content_ids[content]
                         if disabled != last_disabled:
                             self.logger.info("sql", "Record %s %s -> %s changed state to %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
-                        await self.exl(cursor, "UPDATE records SET disabled = %s, last_lb_check = %s, ttl = %s, last_lb_check_result = %s WHERE id = %s",
-                                (disabled, now, records.ttl, hc_result, id))
+                        await self.exl(cursor, "UPDATE records SET disabled = %s, last_lb_check = %s, ttl = %s, prio = %s, last_lb_check_result = %s WHERE id = %s",
+                                (disabled, now, records.ttl, en_res.priority, en_res.retcode, id))
                     else:
                         self.logger.info("sql", "Record %s %s -> %s adding new record with state %s" % (name, records.type, content, "disabled" if disabled else "enabled"))
-                        await self.exl(cursor, "INSERT INTO records(domain_id, name, type, content, ttl, disabled, last_lb_check, last_lb_check_result)" +
-                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                            (self.domain_id, name, records.type, content, records.ttl, disabled, now, hc_result))
+                        await self.exl(cursor, "INSERT INTO records(domain_id, name, type, content, ttl, disabled, last_lb_check, prio, last_lb_check_result)" +
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            (self.domain_id, name, records.type, content, records.ttl, disabled, now, en_res.priority, en_res.retcode))
                 if len(delete_ids):
                     self.logger.info('sql', 'Deleting old or fallback entries of %s %s: %r' % (name, records.type, delete_ids))
                     await self.exl(cursor, "DELETE FROM records WHERE id IN (" + ",".join(str(i) for i in delete_ids) + ")")
