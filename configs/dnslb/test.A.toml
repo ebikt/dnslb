@@ -1,6 +1,6 @@
 #: vim: set ft=dosini :
 ["test".A]
-dest     = [ "test1.cent", "test2.cent" ]
+dest     = [ "test1.cent@3", "test2.cent@1" ]
 shift    = 3
 check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';" ]
 expect   = "(^|\n)GOOD(\n|$)"

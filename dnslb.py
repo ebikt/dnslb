@@ -62,8 +62,21 @@ class Records: # {{{
         self.results   = results
 # }}}
 
-DNSResult = Tuple[str, List[str]]
+class Dest: # {{{
+    name:str
+    prio = 1
+    def __init__(self, dest_str: str) -> None:
+        """ currently only `domain` or `domain@priority` supported """
+        p = dest_str.split('@',1)
+        self.name = p[0]
+        if len(p) > 1:
+            try:
+                self.prio = int(p[1])
+            except Exception:
+                raise ConfigError("priority after '@' must be integer, got {}".format(repr(dest_str)))
+# }}}
 
+DNSResult = Tuple[Dest, List[str]]
 
 class RecordController: # {{{
     """ This is in fact launcher of checks for one "loadbalanced" record.
@@ -104,7 +117,7 @@ class RecordController: # {{{
                 }.get(self.proto, 0)
 
             self.ttl         = config.int('ttl')
-            self.dest        = config.l_str('dest')
+            self.dest        = [ Dest(d) for d in config.l_str('dest') ]
             self.interval    = config.float('interval')
             self.shift       = config.float('shift')
             self.check       = config.l_str('check')
@@ -132,7 +145,7 @@ class RecordController: # {{{
     def id(self) -> "RecordController.Id":
         return (self.name, self.proto)
 
-    async def run_check(self, address: str) -> None: # {{{
+    async def run_check(self, query: Dest, address: str) -> None: # {{{
         fmt = { "address": address}
         cmdline = [ x % fmt for x in self.check ]
         logprefix = "%s,%s" % (self.logprefix, address)
@@ -159,8 +172,8 @@ class RecordController: # {{{
                         self.logger.debug(logprefix, "destination OK, priority not matched (disabling by prio: -1)")
                     self.results[address] = HealthCheckResult( result.returncode, prio)
                 else:
-                    self.logger.debug(logprefix, "destination OK")
-                    self.results[address] = HealthCheckResult( result.returncode, 1)
+                    self.logger.debug(logprefix, "destination OK, setting priority %d" % (query.prio,))
+                    self.results[address] = HealthCheckResult( result.returncode, query.prio)
             else:
                 self.logger.debug(logprefix, "destination failed: regex not matched")
                 self.results[address] = HealthCheckResult( HealthCheckResult.NOT_MATCHED )
@@ -169,11 +182,11 @@ class RecordController: # {{{
             pass
     # }}}
 
-    async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DNSResult], str) -> None # {{{
+    async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DNSResult], Dest) -> None # {{{
         logprefix = "%s:%s" % (self.logprefix, dest)
         self.logger.debug(logprefix, "issuing getaddrinfo()")
         try:
-            aresult = await trio.socket.getaddrinfo(dest, 0, self.family, self.socktype, self.proto, 0) # type: ignore
+            aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0) # type: ignore
             result: List[str] = [ r[4][0] for r in aresult ] # type: ignore
             self.logger.debug(logprefix, "getaddrinfo returned %d results" % (len(result),))
             await queue.send( (dest, result) )
@@ -208,7 +221,7 @@ class RecordController: # {{{
                     if address not in self.results:
                         self.logger.debug(self.logprefix, " %s -> %s, Queueing check." % (query, address))
                         self.results[address] = HealthCheckResult(HealthCheckResult.TIMED_OUT)
-                        nursery.start_soon(self.run_check, address)
+                        nursery.start_soon(self.run_check, query, address)
                     else:
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
     # }}}

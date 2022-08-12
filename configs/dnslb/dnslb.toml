@@ -33,7 +33,9 @@ timeout      = 5
 dns_timeout  = 3
 
 [records."dbrep.gm".A]
-dest     = [ "gmsql3.cent", "gmsql4.cent" ]
+# We accept priority after @ in dest string.
+# That priority is used only if prio_regex is not specified.
+dest     = [ "gmsql3.cent@2", "gmsql4.cent" ]
 shift    = 3
 check    = [ "/usr/bin/mysql", "-h", "%(address)s", "-u", "healthcheck", "-phealthcheck", "-Bse", "select 'GOOD';" ]
 expect   = "(^|\n)GOOD(\n|$)"
@@ -42,6 +44,8 @@ fallback = "gmsql1.cent"
 # If check returns priority information (integer) we can parse it
 # by following regexp (default empty):
 # prio_regex = "^OK: priority ([0-9]+)"
+# If prio_regex fails to match, then destination is disabled.
+# This can be used for better reporting whether server is intentionally down.
 
 # Minimum count of servers when disabling servers by priority
 # Example:
