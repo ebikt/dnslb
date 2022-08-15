@@ -161,7 +161,10 @@ class RecordController: # {{{
             elif self.regex.search(outu):
                 if self.prio_regex is not None:
                     m = self.prio_regex.search(outu)
-                    if m:
+                    if m and m.group(1) == '@':
+                        self.logger.debug(logprefix, "destination OK, setting priority %d (captured @)" % (query.prio,))
+                        self.results[address] = HealthCheckResult( result.returncode, query.prio)
+                    elif m:
                         try:
                             prio = int(cast(str, m.group(1)))
                         except ValueError:
