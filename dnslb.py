@@ -36,25 +36,28 @@ else:
         # Python 3.7-
 
 class HealthCheckResult:
-    enabled:  bool
     retcode:  int
     priority: Optional[int]
 
     NOT_MATCHED = -1
     TIMED_OUT   = -2
 
-    def __init__(self, retcode: Union["HealthCheckResult", int], priority: Optional[int] = None):
-        if isinstance(retcode, HealthCheckResult):
-            self.retcode  = retcode.retcode
-            self.priority = retcode.priority
-            self.enabled  = priority is not None and priority > 0
-        else:
-            self.retcode  = retcode
-            self.priority = priority
+    def __init__(self, retcode: int, priority: Optional[int] = None):
+        self.retcode  = retcode
+        self.priority = priority
+
+class HealthCheckRecord:
+    enabled:  bool
+    retcode:  int
+    priority: Optional[int]
+    def __init__(self, result: Union[HealthCheckResult, "HealthCheckRecord"], enabled: bool):
+        self.retcode  = result.retcode
+        self.priority = result.priority
+        self.enabled  = enabled
 
 class Records: # {{{
 
-    def __init__(self, rc: "RecordController", results: Dict[str, HealthCheckResult]) -> None:
+    def __init__(self, rc: "RecordController", results: Dict[str, HealthCheckRecord]) -> None:
         self.type      = rc.type
         self.name      = rc.name
         self.ttl       = rc.ttl
@@ -161,7 +164,7 @@ class RecordController: # {{{
             elif self.regex.search(outu):
                 if self.prio_regex is not None:
                     m = self.prio_regex.search(outu)
-                    if m and m.group(1) == '@':
+                    if m and cast(str, m.group(1)) == '@':
                         self.logger.debug(logprefix, "destination OK, setting priority %d (captured @)" % (query.prio,))
                         self.results[address] = HealthCheckResult( result.returncode, query.prio)
                     elif m:
@@ -243,9 +246,9 @@ class RecordController: # {{{
                 for rv in self.results.values():
                     if rv.priority and rv.priority > 0: any_ok = True
 
-                records:Dict[str,HealthCheckResult]
+                records:Dict[str,HealthCheckRecord]
                 if not any_ok:
-                    records = { k:HealthCheckResult(v) for k, v in self.results.items() }
+                    records = { k:HealthCheckRecord(v, False) for k, v in self.results.items() }
                     if self.fallback:
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
                         try:
@@ -258,7 +261,7 @@ class RecordController: # {{{
                             self.logger.warning(self.logprefix, "Cannot resolve fallback. Deleting entry.")
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
-                            records[r] = HealthCheckResult(records.get(r, HealthCheckResult(0, None)), 1)
+                            records[r] = HealthCheckRecord(records.get(r, HealthCheckResult(0, None)), True)
                     else:
                         self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
                 else:
@@ -276,7 +279,7 @@ class RecordController: # {{{
                             break
                     if minv > 1: minv -= 1
                     else: minv = 0
-                    records = { k:HealthCheckResult(v, None if v.priority is None else v.priority - minv)
+                    records = { k:HealthCheckRecord(v, False if v.priority is None else v.priority > minv)
                                 for k, v in self.results.items() }
 
                 self.logger.debug(self.logprefix, "Sending result")
