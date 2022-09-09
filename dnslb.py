@@ -79,7 +79,8 @@ class Dest: # {{{
                 raise ConfigError("priority after '@' must be integer, got {}".format(repr(dest_str)))
 # }}}
 
-DNSResult = Tuple[Dest, List[str]]
+""" What do Dest resolve to in DNS. """
+DestIPs = Tuple[Dest, List[str]]
 
 class RecordController: # {{{
     """ This is in fact launcher of checks for one "loadbalanced" record.
@@ -188,7 +189,7 @@ class RecordController: # {{{
             pass
     # }}}
 
-    async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DNSResult], Dest) -> None # {{{
+    async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DestIPs], Dest) -> None # {{{
         logprefix = "%s:%s" % (self.logprefix, dest)
         self.logger.debug(logprefix, "issuing getaddrinfo()")
         try:
@@ -204,7 +205,7 @@ class RecordController: # {{{
             pass
     # }}}
 
-    async def resolve_all(self, queue): # type: (trio.MemorySendChannel[DNSResult]) -> None # {{{
+    async def resolve_all(self, queue): # type: (trio.MemorySendChannel[DestIPs]) -> None # {{{
         async with queue:
             self.logger.debug(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
             with trio.move_on_after(self.dns_timeout):
@@ -219,7 +220,7 @@ class RecordController: # {{{
             self.logger.debug(self.logprefix, "all entries resolved")
     # }}}
 
-    async def process_resolved(self, queue, nursery): # type: (trio.MemoryReceiveChannel[DNSResult], trio.Nursery) -> None # {{{
+    async def process_resolved(self, queue, nursery): # type: (trio.MemoryReceiveChannel[DestIPs], trio.Nursery) -> None # {{{
         self.results = {}
         async with queue:
             async for query, result in queue:
@@ -235,8 +236,8 @@ class RecordController: # {{{
     async def run_one(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
         async with limiter:
             try:
-                qin:  trio.MemorySendChannel[DNSResult]
-                qout: trio.MemoryReceiveChannel[DNSResult]
+                qin:  trio.MemorySendChannel[DestIPs]
+                qout: trio.MemoryReceiveChannel[DestIPs]
                 qin, qout = trio.open_memory_channel(len(self.dest))
                 async with trio.open_nursery() as nursery:
                     nursery.start_soon(self.resolve_all, qin)
