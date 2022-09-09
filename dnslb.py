@@ -23,6 +23,7 @@ from dnslb.config_extractor import ConfigExtractor, ConfigError, MissingConfigEr
 from dnslb.simple_logger    import Logger
 from dnslb.systemd_notifier import SDNotifier
 
+# {{{ Typing tweaks
 MYPY=False
 if MYPY:
     from typing_extensions import TypedDict
@@ -34,8 +35,10 @@ else:
     except TypeError:
         ReStr = re.Pattern
         # Python 3.7-
+# }}}
 
-class HealthCheckResult:
+class HealthCheckResult: # {{{
+    """ Result of single health check. """
     retcode:  int
     priority: Optional[int]
 
@@ -45,18 +48,26 @@ class HealthCheckResult:
     def __init__(self, retcode: int, priority: Optional[int] = None):
         self.retcode  = retcode
         self.priority = priority
+# }}}
 
-class HealthCheckRecord:
+class HealthCheckRecord: # {{{
+    """ Result of single health check after calculation of priority threshold
+        and comparing priority to the threshold.
+        (`enabled` contains result of that comparsion) """
     enabled:  bool
     retcode:  int
     priority: Optional[int]
     def __init__(self, result: Union[HealthCheckResult, "HealthCheckRecord"], enabled: bool):
+        # We also accept HealthCheckRecord in initialiser, for the special case when fallback
+        # hostname is same as one of the balanced hostnames. We need to override value
+        # of the enabled flag then.
         self.retcode  = result.retcode
         self.priority = result.priority
         self.enabled  = enabled
+# }}}
 
 class Records: # {{{
-
+    """ Records for one loadbalanced address as they will be stored into DNS database. """
     def __init__(self, rc: "RecordController", results: Dict[str, HealthCheckRecord]) -> None:
         self.type      = rc.type
         self.name      = rc.name
@@ -66,6 +77,7 @@ class Records: # {{{
 # }}}
 
 class Dest: # {{{
+    """ Parsing of destination string from configuration. """
     name:str
     prio = 1
     def __init__(self, dest_str: str) -> None:
@@ -83,7 +95,7 @@ class Dest: # {{{
 DestIPs = Tuple[Dest, List[str]]
 
 class RecordController: # {{{
-    """ This is in fact launcher of checks for one "loadbalanced" record.
+    """ This is in fact launcher of checks for one "loadbalanced" entry.
         It periodically runs checks and submits results to trio channel
         specified in run() method.
 
@@ -150,6 +162,9 @@ class RecordController: # {{{
         return (self.name, self.proto)
 
     async def run_check(self, query: Dest, address: str) -> None: # {{{
+        """ Do a health check of single destination address `address`
+            (including parsing output) and store result in `self.results`. """
+
         fmt = { "address": address}
         cmdline = [ x % fmt for x in self.check ]
         logprefix = "%s,%s" % (self.logprefix, address)
@@ -190,6 +205,9 @@ class RecordController: # {{{
     # }}}
 
     async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DestIPs], Dest) -> None # {{{
+        """ Resolve single destination name to one or more ip addresses,
+            send result into queue."""
+
         logprefix = "%s:%s" % (self.logprefix, dest)
         self.logger.debug(logprefix, "issuing getaddrinfo()")
         try:
@@ -206,6 +224,10 @@ class RecordController: # {{{
     # }}}
 
     async def resolve_all(self, queue): # type: (trio.MemorySendChannel[DestIPs]) -> None # {{{
+        """ Resolve all destination addresses in parallel
+            with abort after timeout.
+            Send results into `queue` as soon as they are available. """
+
         async with queue:
             self.logger.debug(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
             with trio.move_on_after(self.dns_timeout):
@@ -221,6 +243,9 @@ class RecordController: # {{{
     # }}}
 
     async def process_resolved(self, queue, nursery): # type: (trio.MemoryReceiveChannel[DestIPs], trio.Nursery) -> None # {{{
+        """ Run health check on resolved destination addresses in parallel,
+            as soon as they pop up in `queue`.
+            Results of the healh checks are stored in `self.results`. """
         self.results = {}
         async with queue:
             async for query, result in queue:
@@ -234,14 +259,27 @@ class RecordController: # {{{
     # }}}
 
     async def run_one(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
+        """ Single iteration of health-checking all destination records
+            for one loadbalanced entry.
+            Resolves all destination entries and runs health checks
+            on them. Then it calculates priority thresholds and decides
+            which destination entries will be visible in DNS.
+            Send Records (result of this computation) to sqlchannel.
+
+            Note: Parallel run of more instances of this method on single
+                  instance of RecordController is not supported. """
         async with limiter:
             try:
                 qin:  trio.MemorySendChannel[DestIPs]
                 qout: trio.MemoryReceiveChannel[DestIPs]
                 qin, qout = trio.open_memory_channel(len(self.dest))
+
                 async with trio.open_nursery() as nursery:
+                    # Start resolver (it writes results to qin)
                     nursery.start_soon(self.resolve_all, qin)
+                    # Start healthchecks as soon as they are available (in qout)
                     nursery.start_soon(self.process_resolved, qout, nursery)
+                    # Wait for all async stuff in this block to finish.
 
                 any_ok = False
                 for rv in self.results.values():
@@ -249,6 +287,9 @@ class RecordController: # {{{
 
                 records:Dict[str,HealthCheckRecord]
                 if not any_ok:
+                    # No destination record did pass the healthcheck, process fallback destination record.
+                    # Note that we do not have explicit timeout for dns resolving fallback record.
+
                     records = { k:HealthCheckRecord(v, False) for k, v in self.results.items() }
                     if self.fallback:
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
@@ -266,6 +307,9 @@ class RecordController: # {{{
                     else:
                         self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
                 else:
+                    # Some destination records passed the healthcheck. Calculate priority threshold
+                    # and use it for converting HealthCheckResults to HealthCheckRecords.
+
                     histo:Dict[int, int] = {}
                     for v in self.results.values():
                         if v.priority and v.priority > 0:
@@ -294,6 +338,8 @@ class RecordController: # {{{
     # }}}
 
     async def run_loop(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
+        """ Run iteration `run_one()` at configured times.
+            (when (time.time() - self.shift) % self.interval == 0). """
         while True:
             sleep = self.interval - (time.time() - self.shift) % self.interval
             self.logger.debug(self.logprefix, "waiting %.2f seconds" % (sleep,))
@@ -302,13 +348,16 @@ class RecordController: # {{{
     # }}}
 # }}}
 
-if MYPY:
-    # Some typed cursor magic
+if MYPY: # {{{ Some typed SQL cursor magic
     C_id         = TypedDict('C_id',         {"id": int})
     C_id_c_d     = TypedDict('C_id_c_d',     {"id": int,   "content": str,  "disabled": int})
     C_name_type  = TypedDict('C_name_type',  {"name": str, "type":    str})
+# }}}
 
 def nameFromAscii(s: Union[str, bytes, int], strict:bool = True) -> str: # {{{
+    """ Convert ascii string/sequence of bytes to string. Raise
+        assertion if other input(int) is provided.
+        We need this to cope with untyped output of SQL queries. """
     if isinstance(s, str):
         return s
     elif isinstance(s, bytes):
@@ -319,9 +368,14 @@ def nameFromAscii(s: Union[str, bytes, int], strict:bool = True) -> str: # {{{
 # }}}
 
 class SqlController:# {{{
+    """ Object that handles communication with SQL database with
+        records for PowerDNS for configured DNSLB domain. """
+
     domain_id: int
 
     def __init__(self, zone: str, delete_unknowns: bool, sql_cfg: ConfigExtractor, logger: "Logger") -> None: # {{{
+        """ Early initialization. See prepare() for asynchronous part. """
+
         self.logger = logger
         self.delete_unknowns = delete_unknowns
         self.domain_name = '.' + zone.lstrip('.')
@@ -335,6 +389,7 @@ class SqlController:# {{{
 
     async def exl(self, cursor: trio_mysql.cursors.Cursor, query: str, arg: Optional[object]=None) -> None: # {{{
         """ Log and execute query. Internal function. """
+
         if arg is None:
             self.logger.debug("sql", "Executing `%s`" % (query,))
             await cursor.execute(query)
@@ -352,6 +407,7 @@ class SqlController:# {{{
 
     async def prepare(self) -> None: # {{{
         """ Asynchronous part of init """
+
         await self.conn.connect()
         async with self.conn.cursor() as cursor: # type: trio_mysql.TCursor[C_id]
             await self.exl(cursor, "SELECT id FROM domains WHERE name = %s", (self.domain_name[1:],))
@@ -361,6 +417,7 @@ class SqlController:# {{{
 
     async def delete_unknown_entries(self, known_set: Set[Tuple[str, str]]) -> None: # {{{
         """ Deletes all entries that are not in known_set. """
+
         assert self.domain_name.startswith('.')
         unknown_set = set()
         self.logger.debug("sql", "Examining database for records not in %r" % (known_set,))
@@ -384,7 +441,16 @@ class SqlController:# {{{
     # }}}
 
     async def update_records(self, records: Records) -> None: # {{{
-        """ Insert results of RecordController into database. """
+        """ Insert results of RecordController into database.
+            Note that we do not use transactions here as we expect
+            only single isinstance of dnslb software to be modifying
+            data in the database. Moreover DNS itself is not atomic,
+            thus we do not try to prevent DNS from seeing mixed result
+            of old and new data. We do insert/update before delete,
+            so that there is a chance to always return some adresses.
+            TTL should be set to some small value (1s) to prevent caches
+            from keeping inconsistent data too long. """
+
         assert self.domain_name.startswith('.')
         name = records.name + self.domain_name
         now = int(records.timestamp)
@@ -421,7 +487,7 @@ class SqlController:# {{{
     # }}}
 # }}}
 
-def expand_glob(prefix: str, pattern: str, empty_error: Optional[str] = None) ->List[str]:
+def expand_glob(prefix: str, pattern: str, empty_error: Optional[str] = None) ->List[str]: # {{{
     if pattern.startswith('/'):
         ret = glob.glob(pattern)
         err = f"{empty_error}: {pattern} not found."
@@ -431,6 +497,7 @@ def expand_glob(prefix: str, pattern: str, empty_error: Optional[str] = None) ->
     if len(ret) == 0 and empty_error:
         raise ConfigError(err)
     return [ os.path.realpath(x) for x in ret]
+# }}}
 
 class Main: # {{{
     """ And now, put it all together, mix, stir, boil for 15 minutes, ... """
@@ -569,7 +636,7 @@ class Main: # {{{
                     raise
     # }}}
 
-    async def handle_reload(self, sigiter: AsyncIterator[signal.Signals], canceler: trio.CancelScope) -> None:
+    async def handle_reload(self, sigiter: AsyncIterator[signal.Signals], canceler: trio.CancelScope) -> None: # {{{
         async for signum in sigiter:
             if signum == signal.SIGUSR1:
                 self.logger.info('main', 'Reloading')
@@ -580,10 +647,11 @@ class Main: # {{{
                 except Exception as e:
                     self.logger.error('main', 'Error loading new configuration: %s' % (e,))
                     await self.sd_notifier.notify("Reload failed!", ready=True)
-                    continue
+                    continue # Wait for next SIGUSR1
                 self.next_main = new_main
                 canceler.cancel()
                 return
+    # }}}
 
     next_main: Optional["Main"]
 
