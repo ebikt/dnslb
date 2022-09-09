@@ -359,7 +359,7 @@ class SqlController:# {{{
             self.domain_id = row['id']
     # }}}
 
-    async def delete_unkown_entries(self, known_set: Set[Tuple[str, str]]) -> None: # {{{
+    async def delete_unknown_entries(self, known_set: Set[Tuple[str, str]]) -> None: # {{{
         """ Deletes all entries that are not in known_set. """
         assert self.domain_name.startswith('.')
         unknown_set = set()
@@ -375,7 +375,7 @@ class SqlController:# {{{
                         if entry not in known_set:
                             unknown_set.add( (name, type_, self.domain_id) )
                 if len(unknown_set):
-                    if self.delete_unkown_entries:
+                    if self.delete_unknowns:
                         self.logger.warning("sql", "Deleting unknown entries: %r" % (unknown_set))
                         for unk in unknown_set:
                             await self.exl(cursor, "DELETE FROM records WHERE name = %s AND type = %s AND domain_id = %s", unk)
@@ -599,7 +599,7 @@ class Main: # {{{
     # }}}
 
     async def main(self, usr1: AsyncIterator[signal.Signals]) -> Optional["Main"]: # {{{
-        await self.sql.delete_unkown_entries(set([(rc.name, rc.type) for rc in self.rcs]))
+        await self.sql.delete_unknown_entries(set([(rc.name, rc.type) for rc in self.rcs]))
         sqlin:  trio.MemorySendChannel[Records]
         sqlout: trio.MemoryReceiveChannel[Records]
         sqlin, sqlout = trio.open_memory_channel(len(self.rcs))
