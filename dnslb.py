@@ -183,6 +183,7 @@ class RecordController: # {{{
                     if m and cast(str, m.group(1)) == '@':
                         self.logger.debug(logprefix, "destination OK, setting priority %d (captured @)" % (query.prio,))
                         self.results[address] = HealthCheckResult( result.returncode, query.prio)
+                        prio = query.prio
                     elif m:
                         try:
                             prio = int(cast(str, m.group(1)))
