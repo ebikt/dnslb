@@ -212,8 +212,8 @@ class RecordController: # {{{
         logprefix = "%s:%s" % (self.logprefix, dest)
         self.logger.debug(logprefix, "issuing getaddrinfo()")
         try:
-            aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0) # type: ignore
-            result: List[str] = [ r[4][0] for r in aresult ] # type: ignore
+            aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0)
+            result = [ r[4][0] for r in aresult ]
             self.logger.debug(logprefix, "getaddrinfo (%s) returned %d results" % (dest.name, len(result)))
             await queue.send( (dest, result) )
         except trio.Cancelled as e:
@@ -306,8 +306,8 @@ class RecordController: # {{{
                     if self.fallback:
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
                         try:
-                            aresult = await trio.socket.getaddrinfo(self.fallback, 0, self.family, self.socktype, self.proto, 0) # type: ignore
-                            result: List[str] = [ r[4][0] for r in aresult ] # type: ignore
+                            aresult = await trio.socket.getaddrinfo(self.fallback, 0, self.family, self.socktype, self.proto, 0)
+                            result = [ r[4][0] for r in aresult ]
                         except Exception as e:
                             self.logger.warning(self.logprefix, "fallback getaddrinfo failed: %s" % (e,))
                             result = []
@@ -651,7 +651,7 @@ class Main: # {{{
                     raise
     # }}}
 
-    async def handle_reload(self, sigiter: AsyncIterator[signal.Signals], canceler: trio.CancelScope) -> None: # {{{
+    async def handle_reload(self, sigiter: AsyncIterator[int], canceler: trio.CancelScope) -> None: # {{{
         async for signum in sigiter:
             if signum == signal.SIGUSR1:
                 self.logger.info('main', 'Reloading')
@@ -681,7 +681,7 @@ class Main: # {{{
         return not self.check_config
     # }}}
 
-    async def main(self, usr1: AsyncIterator[signal.Signals]) -> Optional["Main"]: # {{{
+    async def main(self, usr1: AsyncIterator[int]) -> Optional["Main"]: # {{{
         await self.sql.delete_unknown_entries(set([(rc.name, rc.type) for rc in self.rcs]))
         sqlin:  trio.MemorySendChannel[Records]
         sqlout: trio.MemoryReceiveChannel[Records]
