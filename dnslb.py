@@ -13,7 +13,7 @@ import glob
 
 from typing import AsyncIterator, Dict, List, Optional, Set, Tuple, cast, Union
 
-sys.path.insert(0, os.path.dirname(__file__) + '/lib')
+sys.path.insert(0, (os.path.dirname(__file__) or '.') + '/lib')
 
 import trio
 import trio_mysql
@@ -214,13 +214,19 @@ class RecordController: # {{{
         try:
             aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0) # type: ignore
             result: List[str] = [ r[4][0] for r in aresult ] # type: ignore
-            self.logger.debug(logprefix, "getaddrinfo returned %d results" % (len(result),))
+            self.logger.debug(logprefix, "getaddrinfo (%s) returned %d results" % (dest.name, len(result)))
             await queue.send( (dest, result) )
         except trio.Cancelled as e:
-            self.logger.warning(logprefix, "getaddrinfo cancelled: %s" % (e,))
+            self.logger.warning(logprefix, "getaddrinfo (%s) cancelled: %s" % (dest.name, e))
             raise
+        except socket.gaierror as e:
+            if e.errno in (socket.EAI_NODATA,):
+                self.logger.warning(logprefix, "getaddrinfo (%s) \"failed\": %s - using empty result" % (dest.name, e))
+                await queue.send( (dest, []) )
+            else:
+                self.logger.warning(logprefix, "getaddrinfo (%s) failed: %s" % (dest.name, e))
         except Exception as e:
-            self.logger.error(logprefix, "getaddrinfo failed: %s" % (e,))
+            self.logger.error(logprefix, "getaddrinfo (%s) failed: %s" % (dest.name, e))
             pass
     # }}}
 
@@ -229,13 +235,15 @@ class RecordController: # {{{
             with abort after timeout.
             Send results into `queue` as soon as they are available. """
 
+        self.expected_resolves = 0
         async with queue:
-            self.logger.debug(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
+            self.logger.info(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
             with trio.move_on_after(self.dns_timeout):
                 try:
                     async with trio.open_nursery() as nursery:
                         for dest in self.dest:
                             self.logger.debug(self.logprefix, "start soon: resolve %r" % (dest,))
+                            self.expected_resolves += 1 # Will be decreased when resolve_one returns some result
                             nursery.start_soon(self.resolve_one, queue, dest)
                 except Exception as e:
                     self.logger.debug(self.logprefix, "exc %s" % (e,))
@@ -257,6 +265,7 @@ class RecordController: # {{{
                         nursery.start_soon(self.run_check, query, address)
                     else:
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
+                self.expected_resolves -= 1
     # }}}
 
     async def run_one(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
@@ -286,6 +295,8 @@ class RecordController: # {{{
                 for rv in self.results.values():
                     if rv.priority and rv.priority > 0: any_ok = True
 
+                delete = self.expected_resolves == 0
+                deleting = " Deleting entry." if delete else " No update (resolve failure)."
                 records:Dict[str,HealthCheckRecord]
                 if not any_ok:
                     # No destination record did pass the healthcheck, process fallback destination record.
@@ -301,12 +312,12 @@ class RecordController: # {{{
                             self.logger.warning(self.logprefix, "fallback getaddrinfo failed: %s" % (e,))
                             result = []
                         if len(result) == 0:
-                            self.logger.warning(self.logprefix, "Cannot resolve fallback. Deleting entry.")
+                            self.logger.warning(self.logprefix, "Cannot resolve fallback." + deleting)
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
                             records[r] = HealthCheckRecord(records.get(r, HealthCheckResult(0, None)), True)
                     else:
-                        self.logger.warning(self.logprefix, "All checks failed, no fallback provided, deleting entry.")
+                        self.logger.warning(self.logprefix, "All checks failed, no fallback provided." + deleting)
                 else:
                     # Some destination records passed the healthcheck. Calculate priority threshold
                     # and use it for converting HealthCheckResults to HealthCheckRecords.
@@ -328,8 +339,11 @@ class RecordController: # {{{
                     records = { k:HealthCheckRecord(v, False if v.priority is None else v.priority > minv)
                                 for k, v in self.results.items() }
 
-                self.logger.debug(self.logprefix, "Sending result")
-                await sqlqueue.send(Records(self, records))
+                if len(records) or delete:
+                    self.logger.debug(self.logprefix, "Sending result")
+                    await sqlqueue.send(Records(self, records))
+                else:
+                    self.logger.error(self.logprefix, "Not updating due to resolve failure(s).")
                 self.results = None # type: ignore # Disable editting of self.results after passed away
             except trio.Cancelled:
                 raise
