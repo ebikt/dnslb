@@ -80,6 +80,8 @@ class Dest: # {{{
     """ Parsing of destination string from configuration. """
     name:str
     prio = 1
+    cache_value:List[str]
+    cache_time = 0.0
     def __init__(self, dest_str: str) -> None:
         """ currently only `domain` or `domain@priority` supported """
         p = dest_str.split('@',1)
@@ -93,6 +95,18 @@ class Dest: # {{{
 
 """ What do Dest resolve to in DNS. """
 DestIPs = Tuple[Dest, List[str]]
+
+class ResolvingContext: # {{{
+    if MYPY:
+        qsend: trio.MemorySendChannel[DestIPs]
+        qrecv: trio.MemoryReceiveChannel[DestIPs]
+    def __init__(self, queue_len, nursery): # type: (int, trio.Nursery) -> None
+        self.t_start = time.time()
+        self.t_resolved = -1.0
+        self.qsend, self.qrecv = trio.open_memory_channel(queue_len)
+        self.expected_resolves:Set[str] = set()
+        self.nursery = nursery
+# }}}
 
 class RecordController: # {{{
     """ This is in fact launcher of checks for one "loadbalanced" entry.
@@ -111,6 +125,7 @@ class RecordController: # {{{
     family:  socket.AddressFamily
     prio_regex:    Optional[ReStr]
     prio_min_cnt: int
+    dest:    Dict[str, Dest]
 
     def __init__(self, name: str, type: str, config: ConfigExtractor, logger: Optional["Logger"]): # {{{
         with config:
@@ -133,7 +148,13 @@ class RecordController: # {{{
                 }.get(self.proto, 0)
 
             self.ttl         = config.int('ttl')
-            self.dest        = [ Dest(d) for d in config.l_str('dest') ]
+            self.dest = {}
+            for ds in config.l_str('dest'):
+                d = Dest(ds)
+                if d.name in self.dest and d.prio != self.dest[d.name].prio:
+                    raise ConfigError(f"Destination {d.name} occurs multiple times for {self.name} with different priorities.")
+                else:
+                    self.dest[d.name] = d
             self.interval    = config.float('interval')
             self.shift       = config.float('shift')
             self.check       = config.l_str('check')
@@ -141,21 +162,34 @@ class RecordController: # {{{
             self.dns_timeout = config.float('dns_timeout')
             self.regex       = re.compile(config.str('expect'))
             prio_regex       = re.compile(config.str('prio_regex', ''))
+            self.dns_ttl     = config.float('dns_ttl', 300) #FIXME use global value
             if prio_regex.groups > 0:
                 self.prio_regex = prio_regex
             else:
                 self.prio_regex = None
             self.prio_min_cnt = config.int('prio_min_cnt', 1)
-            self.fallback     = config.str('fallback', '')
+            fallback     = config.str('fallback', '')
+            if fallback:
+                if '@' in fallback:
+                    raise ConfigError(f"fallback entry priority is not supported")
+                self.fallback:Optional[Dest] = Dest(fallback)
+            else:
+                self.fallback = None
 
         if logger is not None:
             self.logger = logger
             logprefix = self.logprefix = "%s,%s" % (self.name, self.type)
-            logger.info(logprefix, "dest: %r" % (self.dest,))
-            logger.info(logprefix, "at time %% %.2f == %.2f" % (self.interval, self.timeout))
+            logger.info(logprefix, "dest: " + ', '.join(f"{d.name}@{d.prio}" for _,d in sorted(self.dest.items())))
+            logger.info(logprefix, "at time %% %.2f == %.2f" % (self.interval, self.shift))
             logger.info(logprefix, "check command: %r" % (self.check,))
-            logger.info(logprefix, "check timeout: %.2f, dns timeout %.2f, check.regex:%r" %
+            logger.info(logprefix, "check timeout: %.2f, dns timeout: %.2f, check.regex:%r" %
                 (self.timeout, self.dns_timeout, config.str('expect')))
+
+        dns_ttl_cycles = self.dns_ttl / self.interval
+        if abs(round(dns_ttl_cycles) - dns_ttl_cycles) < 0.01:
+            # dns_ttl is multiple of interval, this may cause
+            # nondeterministic behaviour, so we offset it a little
+            self.dns_ttl += 0.05 * self.interval
     # }}}
 
     def id(self) -> "RecordController.Id":
@@ -205,7 +239,7 @@ class RecordController: # {{{
             pass
     # }}}
 
-    async def resolve_one(self, queue, dest): # type: (trio.MemorySendChannel[DestIPs], Dest) -> None # {{{
+    async def resolve_one(self, ctx, dest): # type: (ResolvingContext, Dest) -> None # {{{
         """ Resolve single destination name to one or more ip addresses,
             send result into queue."""
 
@@ -215,57 +249,72 @@ class RecordController: # {{{
             aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0)
             result = [ r[4][0] for r in aresult ]
             self.logger.debug(logprefix, "getaddrinfo (%s) returned %d results" % (dest.name, len(result)))
-            await queue.send( (dest, result) )
         except trio.Cancelled as e:
             self.logger.warning(logprefix, "getaddrinfo (%s) cancelled: %s" % (dest.name, e))
             raise
         except socket.gaierror as e:
             if e.errno in (socket.EAI_NODATA,):
                 self.logger.warning(logprefix, "getaddrinfo (%s) \"failed\": %s - using empty result" % (dest.name, e))
-                await queue.send( (dest, []) )
+                result = []
             else:
                 self.logger.warning(logprefix, "getaddrinfo (%s) failed: %s" % (dest.name, e))
+                return
         except Exception as e:
             self.logger.error(logprefix, "getaddrinfo (%s) failed: %s" % (dest.name, e))
-            pass
+            return
+
+        dest.cache_value = result
+        dest.cache_time  = ctx.t_start
+        await ctx.qsend.send( (dest, result) )
     # }}}
 
-    async def resolve_all(self, queue): # type: (trio.MemorySendChannel[DestIPs]) -> None # {{{
+    async def resolve_all(self, ctx): # type: (ResolvingContext) -> None # {{{
         """ Resolve all destination addresses in parallel
             with abort after timeout.
             Send results into `queue` as soon as they are available. """
 
-        self.expected_resolves = 0
-        async with queue:
-            self.logger.info(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
+        async with ctx.qsend:
+            self.logger.debug(self.logprefix, "starting to resolve entries (timeout: %.2f)" % (self.dns_timeout,))
             with trio.move_on_after(self.dns_timeout):
                 try:
                     async with trio.open_nursery() as nursery:
-                        for dest in self.dest:
+                        for n, dest in self.dest.items():
+                            assert n == dest.name
                             self.logger.debug(self.logprefix, "start soon: resolve %r" % (dest,))
-                            self.expected_resolves += 1 # Will be decreased when resolve_one returns some result
-                            nursery.start_soon(self.resolve_one, queue, dest)
+                            ctx.expected_resolves.add(n)
+                            nursery.start_soon(self.resolve_one, ctx, dest)
                 except Exception as e:
                     self.logger.debug(self.logprefix, "exc %s" % (e,))
                     raise
-            self.logger.debug(self.logprefix, "all entries resolved")
+            self.logger.debug(self.logprefix, "finished resolving entries")
+            for n in list(ctx.expected_resolves):
+                dest = self.dest[n]
+                if ctx.t_start - dest.cache_time < self.dns_ttl:
+                    await ctx.qsend.send( (dest, dest.cache_value) )
+            ctx.t_resolved = time.time()
     # }}}
 
-    async def process_resolved(self, queue, nursery): # type: (trio.MemoryReceiveChannel[DestIPs], trio.Nursery) -> None # {{{
+    async def process_resolved(self, ctx): # type: (ResolvingContext) -> None # {{{
         """ Run health check on resolved destination addresses in parallel,
             as soon as they pop up in `queue`.
             Results of the healh checks are stored in `self.results`. """
         self.results = {}
-        async with queue:
-            async for query, result in queue:
+        async with ctx.qrecv:
+            async for query, result in ctx.qrecv:
+                try:
+                    ctx.expected_resolves.remove(query.name)
+                except KeyError:
+                    continue
+                if ctx.t_start > query.cache_time:
+                    self.logger.info(self.logprefix, "Using cached dns entries for %s: %r (age %.2f)" %
+                        (query.name, query.cache_value, ctx.t_start - query.cache_time))
                 for address in result:
                     if address not in self.results:
                         self.logger.debug(self.logprefix, " %s -> %s, Queueing check." % (query, address))
                         self.results[address] = HealthCheckResult(HealthCheckResult.TIMED_OUT)
-                        nursery.start_soon(self.run_check, query, address)
+                        ctx.nursery.start_soon(self.run_check, query, address)
                     else:
                         self.logger.debug(self.logprefix, " %s -> %s, Ignoring duplicit result." % (query, address))
-                self.expected_resolves -= 1
     # }}}
 
     async def run_one(self, sqlqueue, limiter): # type: (trio.MemorySendChannel[Records], trio.CapacityLimiter) -> None # {{{
@@ -280,39 +329,68 @@ class RecordController: # {{{
                   instance of RecordController is not supported. """
         async with limiter:
             try:
-                qin:  trio.MemorySendChannel[DestIPs]
-                qout: trio.MemoryReceiveChannel[DestIPs]
-                qin, qout = trio.open_memory_channel(len(self.dest))
-
                 async with trio.open_nursery() as nursery:
-                    # Start resolver (it writes results to qin)
-                    nursery.start_soon(self.resolve_all, qin)
-                    # Start healthchecks as soon as they are available (in qout)
-                    nursery.start_soon(self.process_resolved, qout, nursery)
+                    ctx = ResolvingContext(len(self.dest), nursery)
+                    # Start resolver (it writes results to qsend)
+                    nursery.start_soon(self.resolve_all, ctx)
+                    # Start healthchecks as soon as they are available (in qrecv)
+                    nursery.start_soon(self.process_resolved, ctx)
                     # Wait for all async stuff in this block to finish.
+                if ctx.t_resolved <= 0: ctx.t_resolved = time.time()
+                if len(ctx.expected_resolves):
+                    self.logger.warning(self.logprefix, "Resolved only {resolved} of {total} entries in {time:.3g} seconds.".format(
+                        total = len(self.dest),
+                        resolved = len(self.dest) - len(ctx.expected_resolves),
+                        time = ctx.t_resolved - ctx.t_start
+                    ))
+                    delete = False
+                    deleting = " No update (resolve failure)."
+                else:
+                    delete = True
+                    deleting = " Deleting entry."
 
                 any_ok = False
                 for rv in self.results.values():
                     if rv.priority and rv.priority > 0: any_ok = True
 
-                delete = self.expected_resolves == 0
-                deleting = " Deleting entry." if delete else " No update (resolve failure)."
                 records:Dict[str,HealthCheckRecord]
                 if not any_ok:
                     # No destination record did pass the healthcheck, process fallback destination record.
                     # Note that we do not have explicit timeout for dns resolving fallback record.
 
                     records = { k:HealthCheckRecord(v, False) for k, v in self.results.items() }
-                    if self.fallback:
+                    fallback = self.fallback
+                    if fallback is not None:
+                        if fallback.name in self.dest:
+                            dest = self.dest[fallback.name]
+                        else:
+                            dest = fallback
+                        assert dest.name == fallback.name
                         self.logger.warning(self.logprefix, "All checks failed, resolving fallback.")
-                        try:
-                            aresult = await trio.socket.getaddrinfo(self.fallback, 0, self.family, self.socktype, self.proto, 0)
-                            result = [ r[4][0] for r in aresult ]
-                        except Exception as e:
-                            self.logger.warning(self.logprefix, "fallback getaddrinfo failed: %s" % (e,))
+                        if ctx.t_start - dest.cache_time < min(self.interval, self.dns_ttl) and len(dest.cache_value):
+                            result = dest.cache_value
+                        else:
                             result = []
+                            with trio.move_on_after(self.dns_timeout):
+                                t1 = time.time()
+                                try:
+                                    aresult = await trio.socket.getaddrinfo(dest.name, 0, self.family, self.socktype, self.proto, 0)
+                                    result = [ r[4][0] for r in aresult ]
+
+                                    dest.cache_value = result
+                                    dest.cache_time  = t1
+                                except socket.gaierror as e: # Cache NXDOMAIN
+                                    if e.errno in (socket.EAI_NODATA,):
+                                        dest.cache_value = []
+                                        dest.cache_time = t1
+                                    self.logger.warning(self.logprefix, "fallback getaddrinfo failed: %s" % (e,))
+                                except Exception as e:
+                                    self.logger.warning(self.logprefix, "fallback getaddrinfo failed: %s" % (e,))
                         if len(result) == 0:
-                            self.logger.warning(self.logprefix, "Cannot resolve fallback." + deleting)
+                            if ctx.t_start - dest.cache_time < self.dns_ttl and len(dest.cache_value) > 0:
+                                self.logger.warning(self.logprefix, "Cannot resolve fallback, using cached value")
+                            else:
+                                self.logger.warning(self.logprefix, "Cannot resolve fallback." + deleting)
                         for r in result:
                             self.logger.debug(self.logprefix, "Adding fallback entry %s" % (r,))
                             records[r] = HealthCheckRecord(records.get(r, HealthCheckResult(0, None)), True)
